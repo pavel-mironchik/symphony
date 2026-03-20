@@ -196,6 +196,16 @@ defmodule SymphonyElixir.CoreTest do
     assert {:error, :workflow_front_matter_not_a_map} = Workflow.load(workflow_path)
   end
 
+  test "workflow load preserves UTF-8 prompt text containing кириллица" do
+    workflow_path = Path.join(Path.dirname(Workflow.workflow_file_path()), "UTF8_WORKFLOW.md")
+
+    File.write!(workflow_path, "---\ntracker:\n  kind: linear\n---\nесли в ходе работы возникла существенная неясность\n")
+
+    assert {:ok, %{prompt: prompt, prompt_template: prompt}} = Workflow.load(workflow_path)
+    assert String.valid?(prompt)
+    assert prompt == "если в ходе работы возникла существенная неясность"
+  end
+
   test "SymphonyElixir.start_link delegates to the orchestrator" do
     write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
     Application.put_env(:symphony_elixir, :memory_tracker_issues, [])
