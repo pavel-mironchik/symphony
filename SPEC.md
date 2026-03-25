@@ -678,7 +678,8 @@ Distinct terminal reasons are important because retry logic and logs differ.
 - `claimed` and `running` checks are required before launching any worker.
 - Reconciliation runs before dispatch on every tick.
 - Restart recovery is tracker-driven and filesystem-driven (no durable orchestrator DB required).
-- Startup terminal cleanup removes stale workspaces for issues already in terminal states.
+- Terminal workspace cleanup removes stale workspaces for issues already in terminal states at
+  startup and during hourly sweeps.
 
 ## 8. Polling, Scheduling, and Reconciliation
 
@@ -686,6 +687,9 @@ Distinct terminal reasons are important because retry logic and logs differ.
 
 At startup, the service validates config, performs startup cleanup, schedules an immediate tick, and
 then repeats every `polling.interval_ms`.
+
+Separately, the orchestrator performs a throttled terminal-workspace cleanup sweep at most once per
+hour inside the main loop.
 
 The effective poll interval should be updated when workflow config changes are re-applied.
 
@@ -764,8 +768,8 @@ Retry handling behavior:
 
 Note:
 
-- Terminal-state workspace cleanup is handled by startup cleanup and active-run reconciliation
-  (including terminal transitions for currently running issues).
+- Terminal-state workspace cleanup is handled by startup cleanup, hourly terminal sweeps, and
+  active-run reconciliation (including terminal transitions for currently running issues).
 - Retry handling mainly operates on active candidates and releases claims when the issue is absent,
   rather than performing terminal cleanup itself.
 
@@ -790,7 +794,7 @@ Part B: Tracker state refresh
   - If tracker state is neither active nor terminal: terminate worker without workspace cleanup.
 - If state refresh fails, keep workers running and try again on the next tick.
 
-### 8.6 Startup Terminal Workspace Cleanup
+### 8.6 Terminal Workspace Cleanup
 
 When the service starts:
 
@@ -798,7 +802,14 @@ When the service starts:
 2. For each returned issue identifier, remove the corresponding workspace directory.
 3. If the terminal-issues fetch fails, log a warning and continue startup.
 
-This prevents stale terminal workspaces from accumulating after restarts.
+During steady-state operation:
+
+1. Re-run the same terminal-issues sweep at most once per hour.
+2. Reuse the same tracker terminal-state list and workspace cleanup path used at startup.
+3. If the periodic terminal-issues fetch fails, log a warning and continue orchestrator execution.
+
+This prevents stale terminal workspaces from accumulating after restarts or after issues become
+terminal while no run is active.
 
 ## 9. Workspace Management and Safety
 
@@ -1596,6 +1607,7 @@ After restart:
 - No running sessions are assumed recoverable.
 - Service recovers by:
   - startup terminal workspace cleanup
+  - hourly terminal workspace cleanup after boot
   - fresh polling of active issues
   - re-dispatching eligible work
 
@@ -1712,6 +1724,7 @@ function start_service():
     fail_startup(validation)
 
   startup_terminal_workspace_cleanup()
+  state.next_terminal_workspace_cleanup_due_at_ms = now + 1 hour
   schedule_tick(delay_ms=0)
 
   event_loop(state)
@@ -1721,6 +1734,10 @@ function start_service():
 
 ```text
 on_tick(state):
+  if now >= state.next_terminal_workspace_cleanup_due_at_ms:
+    run_terminal_workspace_cleanup()
+    state.next_terminal_workspace_cleanup_due_at_ms = now + 1 hour
+
   state = reconcile_running_issues(state)
 
   validation = validate_dispatch_config()
@@ -1997,6 +2014,7 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - Active-state issue refresh updates running entry state
 - Non-active state stops running agent without workspace cleanup
 - Terminal state stops running agent and cleans workspace
+- Hourly terminal sweep cleans stale workspaces for terminal issues even when they are not running
 - Reconciliation with no running issues is a no-op
 - Normal worker exit schedules a short continuation retry (attempt 1)
 - Abnormal worker exit increments retries with 10s-based exponential backoff
@@ -2095,7 +2113,7 @@ Use the same validation profiles as Section 17:
 - Exponential retry queue with continuation retries after normal exit
 - Configurable retry backoff cap (`agent.max_retry_backoff_ms`, default 5m)
 - Reconciliation that stops runs on terminal/non-active tracker states
-- Workspace cleanup for terminal issues (startup sweep + active transition)
+- Workspace cleanup for terminal issues (startup sweep + hourly sweep + active transition)
 - Structured logs with `issue_id`, `issue_identifier`, and `session_id`
 - Operator-visible observability (structured logs; optional snapshot/status surface)
 

@@ -12,6 +12,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   @continuation_retry_delay_ms 1_000
   @failure_retry_base_ms 10_000
+  @terminal_workspace_cleanup_interval_ms :timer.hours(1)
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20
   @empty_codex_totals %{
@@ -30,6 +31,7 @@ defmodule SymphonyElixir.Orchestrator do
       :poll_interval_ms,
       :max_concurrent_agents,
       :next_poll_due_at_ms,
+      :next_terminal_workspace_cleanup_due_at_ms,
       :poll_check_in_progress,
       :tick_timer_ref,
       :tick_token,
@@ -57,6 +59,7 @@ defmodule SymphonyElixir.Orchestrator do
       poll_interval_ms: config.polling.interval_ms,
       max_concurrent_agents: config.agent.max_concurrent_agents,
       next_poll_due_at_ms: now_ms,
+      next_terminal_workspace_cleanup_due_at_ms: nil,
       poll_check_in_progress: false,
       tick_timer_ref: nil,
       tick_token: nil,
@@ -64,7 +67,8 @@ defmodule SymphonyElixir.Orchestrator do
       codex_rate_limits: nil
     }
 
-    run_terminal_workspace_cleanup()
+    run_terminal_workspace_cleanup(:startup)
+    state = schedule_next_terminal_workspace_cleanup(state)
     state = schedule_tick(state, 0)
 
     {:ok, state}
@@ -108,6 +112,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   def handle_info(:run_poll_cycle, state) do
     state = refresh_runtime_config(state)
+    state = maybe_run_terminal_workspace_cleanup(state)
     state = maybe_dispatch(state)
     state = schedule_tick(state, state.poll_interval_ms)
     state = %{state | poll_check_in_progress: false}
@@ -879,20 +884,24 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp cleanup_issue_workspace(_identifier, _worker_host), do: :ok
 
-  defp run_terminal_workspace_cleanup do
+  defp maybe_run_terminal_workspace_cleanup(%State{} = state) do
+    now_ms = System.monotonic_time(:millisecond)
+
+    if terminal_workspace_cleanup_due?(state.next_terminal_workspace_cleanup_due_at_ms, now_ms) do
+      run_terminal_workspace_cleanup(:periodic)
+      schedule_next_terminal_workspace_cleanup(state, now_ms)
+    else
+      state
+    end
+  end
+
+  defp run_terminal_workspace_cleanup(mode) when mode in [:startup, :periodic] do
     case Tracker.fetch_issues_by_states(Config.settings!().tracker.terminal_states) do
       {:ok, issues} ->
-        issues
-        |> Enum.each(fn
-          %Issue{identifier: identifier} when is_binary(identifier) ->
-            cleanup_issue_workspace(identifier)
-
-          _ ->
-            :ok
-        end)
+        cleanup_terminal_issue_workspaces(issues)
 
       {:error, reason} ->
-        Logger.warning("Skipping startup terminal workspace cleanup; failed to fetch terminal issues: #{inspect(reason)}")
+        Logger.warning("Skipping #{terminal_workspace_cleanup_mode(mode)} terminal workspace cleanup; failed to fetch terminal issues: #{inspect(reason)}")
     end
   end
 
@@ -1259,6 +1268,11 @@ defmodule SymphonyElixir.Orchestrator do
     }
   end
 
+  defp schedule_next_terminal_workspace_cleanup(%State{} = state, now_ms \\ System.monotonic_time(:millisecond))
+       when is_integer(now_ms) do
+    %{state | next_terminal_workspace_cleanup_due_at_ms: now_ms + @terminal_workspace_cleanup_interval_ms}
+  end
+
   defp schedule_poll_cycle_start do
     :timer.send_after(@poll_transition_render_delay_ms, self(), :run_poll_cycle)
     :ok
@@ -1269,6 +1283,15 @@ defmodule SymphonyElixir.Orchestrator do
   defp next_poll_in_ms(next_poll_due_at_ms, now_ms) when is_integer(next_poll_due_at_ms) do
     max(0, next_poll_due_at_ms - now_ms)
   end
+
+  defp terminal_workspace_cleanup_due?(nil, _now_ms), do: true
+
+  defp terminal_workspace_cleanup_due?(due_at_ms, now_ms)
+       when is_integer(due_at_ms) and is_integer(now_ms) do
+    due_at_ms <= now_ms
+  end
+
+  defp terminal_workspace_cleanup_due?(_due_at_ms, _now_ms), do: true
 
   defp pop_running_entry(state, issue_id) do
     {Map.get(state.running, issue_id), %{state | running: Map.delete(state.running, issue_id)}}
@@ -1302,6 +1325,21 @@ defmodule SymphonyElixir.Orchestrator do
         max_concurrent_agents: config.agent.max_concurrent_agents
     }
   end
+
+  defp cleanup_terminal_issue_workspaces(issues) when is_list(issues) do
+    Enum.each(issues, fn
+      %Issue{identifier: identifier} when is_binary(identifier) ->
+        cleanup_issue_workspace(identifier)
+
+      _ ->
+        :ok
+    end)
+  end
+
+  defp cleanup_terminal_issue_workspaces(_issues), do: :ok
+
+  defp terminal_workspace_cleanup_mode(:startup), do: "startup"
+  defp terminal_workspace_cleanup_mode(:periodic), do: "periodic"
 
   defp retry_candidate_issue?(%Issue{} = issue, terminal_states) do
     candidate_issue?(issue, active_state_set(), terminal_states) and

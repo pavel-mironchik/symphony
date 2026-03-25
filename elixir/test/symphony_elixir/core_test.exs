@@ -428,6 +428,121 @@ defmodule SymphonyElixir.CoreTest do
     end
   end
 
+  test "orchestrator startup cleanup removes workspaces for terminal issues" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-startup-terminal-cleanup-#{System.unique_integer([:positive])}"
+      )
+
+    previous_memory_issues = Application.get_env(:symphony_elixir, :memory_tracker_issues)
+    issue_identifier = "MT-558"
+    workspace = Path.join(test_root, issue_identifier)
+
+    issue = %Issue{
+      id: "issue-startup-terminal",
+      identifier: issue_identifier,
+      state: "Cancelled",
+      title: "Canceled before startup",
+      description: "Should be cleaned on boot",
+      labels: []
+    }
+
+    try do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: test_root,
+        tracker_active_states: ["Todo", "In Progress", "In Review"],
+        tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate"],
+        poll_interval_ms: 30_000
+      )
+
+      File.mkdir_p!(workspace)
+      Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+
+      orchestrator_name = Module.concat(__MODULE__, :StartupTerminalCleanupOrchestrator)
+      {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+      on_exit(fn ->
+        if Process.alive?(pid) do
+          Process.exit(pid, :normal)
+        end
+      end)
+
+      refute File.exists?(workspace)
+    after
+      restore_app_env(:memory_tracker_issues, previous_memory_issues)
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "periodic terminal cleanup removes newly terminal non-running workspaces and throttles to hourly" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-periodic-terminal-cleanup-#{System.unique_integer([:positive])}"
+      )
+
+    previous_memory_issues = Application.get_env(:symphony_elixir, :memory_tracker_issues)
+    issue_id = "issue-periodic-terminal"
+    issue_identifier = "MT-559"
+    workspace = Path.join(test_root, issue_identifier)
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: issue_identifier,
+      state: "Human Review",
+      title: "Waiting for human review",
+      description: "Not active and not terminal yet",
+      labels: []
+    }
+
+    try do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: test_root,
+        tracker_active_states: ["Todo", "In Progress", "In Review"],
+        tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate"],
+        poll_interval_ms: 30_000
+      )
+
+      File.mkdir_p!(workspace)
+      Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+
+      now_ms = System.monotonic_time(:millisecond)
+
+      state = %Orchestrator.State{
+        poll_interval_ms: 30_000,
+        max_concurrent_agents: 10,
+        next_terminal_workspace_cleanup_due_at_ms: now_ms - 1,
+        codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+        codex_rate_limits: nil,
+        retry_attempts: %{}
+      }
+
+      Application.put_env(:symphony_elixir, :memory_tracker_issues, [%{issue | state: "Cancelled"}])
+
+      assert {:noreply, updated_state} = Orchestrator.handle_info(:run_poll_cycle, state)
+      refute File.exists?(workspace)
+      assert_due_in_range(updated_state.next_terminal_workspace_cleanup_due_at_ms, 3_590_000, 3_601_000)
+
+      File.mkdir_p!(workspace)
+
+      assert {:noreply, throttled_state} = Orchestrator.handle_info(:run_poll_cycle, updated_state)
+      assert File.exists?(workspace)
+
+      assert throttled_state.next_terminal_workspace_cleanup_due_at_ms ==
+               updated_state.next_terminal_workspace_cleanup_due_at_ms
+
+      if is_reference(throttled_state.tick_timer_ref) do
+        Process.cancel_timer(throttled_state.tick_timer_ref)
+      end
+    after
+      restore_app_env(:memory_tracker_issues, previous_memory_issues)
+      File.rm_rf(test_root)
+    end
+  end
+
   test "reconcile updates running issue state for active issues" do
     issue_id = "issue-3"
 

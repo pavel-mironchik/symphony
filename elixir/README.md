@@ -25,6 +25,8 @@ skills can make raw Linear GraphQL calls.
 
 If a claimed issue moves to a terminal state (`Done`, `Closed`, `Cancelled`, or `Duplicate`),
 Symphony stops the active agent for that issue and cleans up matching workspaces.
+It also sweeps terminal-state workspaces at startup and once per hour, so issues that become
+terminal while idle do not wait for a service restart before cleanup.
 
 ## How to use it
 
