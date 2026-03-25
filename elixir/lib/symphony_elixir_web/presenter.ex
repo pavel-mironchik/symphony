@@ -3,7 +3,7 @@ defmodule SymphonyElixirWeb.Presenter do
   Shared projections for the observability API and dashboard.
   """
 
-  alias SymphonyElixir.{Config, Orchestrator, StatusDashboard}
+  alias SymphonyElixir.{CodexActivity, Config, Orchestrator, StatusDashboard}
 
   @spec state_payload(GenServer.name(), timeout()) :: map()
   def state_payload(orchestrator, snapshot_timeout_ms) do
@@ -24,15 +24,23 @@ defmodule SymphonyElixirWeb.Presenter do
         }
 
       :timeout ->
-        %{generated_at: generated_at, error: %{code: "snapshot_timeout", message: "Snapshot timed out"}}
+        %{
+          generated_at: generated_at,
+          error: %{code: "snapshot_timeout", message: "Snapshot timed out"}
+        }
 
       :unavailable ->
-        %{generated_at: generated_at, error: %{code: "snapshot_unavailable", message: "Snapshot unavailable"}}
+        %{
+          generated_at: generated_at,
+          error: %{code: "snapshot_unavailable", message: "Snapshot unavailable"}
+        }
     end
   end
 
-  @spec issue_payload(String.t(), GenServer.name(), timeout()) :: {:ok, map()} | {:error, :issue_not_found}
-  def issue_payload(issue_identifier, orchestrator, snapshot_timeout_ms) when is_binary(issue_identifier) do
+  @spec issue_payload(String.t(), GenServer.name(), timeout()) ::
+          {:ok, map()} | {:error, :issue_not_found}
+  def issue_payload(issue_identifier, orchestrator, snapshot_timeout_ms)
+      when is_binary(issue_identifier) do
     case Orchestrator.snapshot(orchestrator, snapshot_timeout_ms) do
       %{} = snapshot ->
         running = Enum.find(snapshot.running, &(&1.identifier == issue_identifier))
@@ -65,6 +73,7 @@ defmodule SymphonyElixirWeb.Presenter do
       issue_identifier: issue_identifier,
       issue_id: issue_id_from_entries(running, retry),
       status: issue_status(running, retry),
+      summary: running_summary_payload(running),
       workspace: %{
         path: workspace_path(issue_identifier, running, retry),
         host: workspace_host(running, retry)
@@ -99,6 +108,8 @@ defmodule SymphonyElixirWeb.Presenter do
     %{
       issue_id: entry.issue_id,
       issue_identifier: entry.identifier,
+      title: Map.get(entry, :title),
+      issue_url: Map.get(entry, :issue_url),
       state: entry.state,
       worker_host: Map.get(entry, :worker_host),
       workspace_path: Map.get(entry, :workspace_path),
@@ -106,6 +117,13 @@ defmodule SymphonyElixirWeb.Presenter do
       turn_count: Map.get(entry, :turn_count, 0),
       last_event: entry.last_codex_event,
       last_message: summarize_message(entry.last_codex_message),
+      secondary_update: secondary_update_payload(entry),
+      current_activity: feed_event_payload(CodexActivity.current_activity(entry)),
+      last_meaningful_update: feed_event_payload(CodexActivity.latest_meaningful_event(entry)),
+      last_command: feed_event_payload(CodexActivity.latest_event(entry, [:command])),
+      last_validation: feed_event_payload(CodexActivity.latest_event(entry, [:validation])),
+      last_blocker: feed_event_payload(CodexActivity.latest_event(entry, [:blocker])),
+      recent_events: recent_events_payload(entry),
       started_at: iso8601(entry.started_at),
       last_event_at: iso8601(entry.last_codex_timestamp),
       tokens: %{
@@ -138,6 +156,12 @@ defmodule SymphonyElixirWeb.Presenter do
       started_at: iso8601(running.started_at),
       last_event: running.last_codex_event,
       last_message: summarize_message(running.last_codex_message),
+      secondary_update: secondary_update_payload(running),
+      current_activity: feed_event_payload(CodexActivity.current_activity(running)),
+      last_meaningful_update: feed_event_payload(CodexActivity.latest_meaningful_event(running)),
+      last_command: feed_event_payload(CodexActivity.latest_event(running, [:command])),
+      last_validation: feed_event_payload(CodexActivity.latest_event(running, [:validation])),
+      last_blocker: feed_event_payload(CodexActivity.latest_event(running, [:blocker])),
       last_event_at: iso8601(running.last_codex_timestamp),
       tokens: %{
         input_tokens: running.codex_input_tokens,
@@ -168,14 +192,44 @@ defmodule SymphonyElixirWeb.Presenter do
   end
 
   defp recent_events_payload(running) do
-    [
-      %{
-        at: iso8601(running.last_codex_timestamp),
-        event: running.last_codex_event,
-        message: summarize_message(running.last_codex_message)
-      }
-    ]
-    |> Enum.reject(&is_nil(&1.at))
+    running
+    |> CodexActivity.recent_events()
+    |> Enum.map(&feed_event_payload/1)
+    |> Enum.reject(&is_nil/1)
+  end
+
+  defp running_summary_payload(nil), do: nil
+
+  defp running_summary_payload(running) do
+    %{
+      current_activity: feed_event_payload(CodexActivity.current_activity(running)),
+      latest_meaningful_update:
+        feed_event_payload(CodexActivity.latest_meaningful_event(running)),
+      secondary_update: secondary_update_payload(running),
+      last_command: feed_event_payload(CodexActivity.latest_event(running, [:command])),
+      last_validation: feed_event_payload(CodexActivity.latest_event(running, [:validation])),
+      last_blocker: feed_event_payload(CodexActivity.latest_event(running, [:blocker]))
+    }
+  end
+
+  defp secondary_update_payload(running) do
+    running
+    |> CodexActivity.secondary_update()
+    |> feed_event_payload()
+  end
+
+  defp feed_event_payload(nil), do: nil
+
+  defp feed_event_payload(event) do
+    %{
+      kind: event.kind |> Atom.to_string(),
+      label: Map.get(event, :label),
+      text: Map.get(event, :text),
+      at: iso8601(Map.get(event, :at)),
+      importance: (Map.get(event, :importance) || :normal) |> Atom.to_string(),
+      status: atom_to_string(Map.get(event, :status)),
+      source: Map.get(event, :source)
+    }
   end
 
   defp summarize_message(nil), do: nil
@@ -189,6 +243,10 @@ defmodule SymphonyElixirWeb.Presenter do
   end
 
   defp due_at_iso8601(_due_in_ms), do: nil
+
+  defp atom_to_string(value) when is_atom(value), do: Atom.to_string(value)
+  defp atom_to_string(value) when is_binary(value), do: value
+  defp atom_to_string(_value), do: nil
 
   defp iso8601(%DateTime{} = datetime) do
     datetime

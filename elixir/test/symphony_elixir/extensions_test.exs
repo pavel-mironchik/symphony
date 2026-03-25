@@ -261,7 +261,8 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert_receive {:graphql_called, state_lookup_query, %{issueId: "issue-1", stateName: "Done"}}
     assert state_lookup_query =~ "states"
 
-    assert_receive {:graphql_called, update_issue_query, %{issueId: "issue-1", stateId: "state-1"}}
+    assert_receive {:graphql_called, update_issue_query,
+                    %{issueId: "issue-1", stateId: "state-1"}}
 
     assert update_issue_query =~ "issueUpdate"
 
@@ -347,6 +348,8 @@ defmodule SymphonyElixir.ExtensionsTest do
                %{
                  "issue_id" => "issue-http",
                  "issue_identifier" => "MT-HTTP",
+                 "title" => nil,
+                 "issue_url" => nil,
                  "state" => "In Progress",
                  "worker_host" => nil,
                  "workspace_path" => nil,
@@ -354,7 +357,15 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "turn_count" => 7,
                  "last_event" => "notification",
                  "last_message" => "rendered",
-                 "started_at" => state_payload["running"] |> List.first() |> Map.fetch!("started_at"),
+                 "secondary_update" => nil,
+                 "current_activity" => nil,
+                 "last_meaningful_update" => nil,
+                 "last_command" => nil,
+                 "last_validation" => nil,
+                 "last_blocker" => nil,
+                 "recent_events" => [],
+                 "started_at" =>
+                   state_payload["running"] |> List.first() |> Map.fetch!("started_at"),
                  "last_event_at" => nil,
                  "tokens" => %{"input_tokens" => 4, "output_tokens" => 8, "total_tokens" => 12}
                }
@@ -386,6 +397,14 @@ defmodule SymphonyElixir.ExtensionsTest do
              "issue_identifier" => "MT-HTTP",
              "issue_id" => "issue-http",
              "status" => "running",
+             "summary" => %{
+               "current_activity" => nil,
+               "latest_meaningful_update" => nil,
+               "secondary_update" => nil,
+               "last_command" => nil,
+               "last_validation" => nil,
+               "last_blocker" => nil
+             },
              "workspace" => %{
                "path" => Path.join(Config.settings!().workspace.root, "MT-HTTP"),
                "host" => nil
@@ -400,6 +419,12 @@ defmodule SymphonyElixir.ExtensionsTest do
                "started_at" => issue_payload["running"]["started_at"],
                "last_event" => "notification",
                "last_message" => "rendered",
+               "secondary_update" => nil,
+               "current_activity" => nil,
+               "last_meaningful_update" => nil,
+               "last_command" => nil,
+               "last_validation" => nil,
+               "last_blocker" => nil,
                "last_event_at" => nil,
                "tokens" => %{"input_tokens" => 4, "output_tokens" => 8, "total_tokens" => 12}
              },
@@ -555,11 +580,15 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert html =~ "status-badge-live"
     assert html =~ "status-badge-offline"
 
+    now = DateTime.utc_now()
+
     updated_snapshot =
       put_in(snapshot.running, [
         %{
           issue_id: "issue-http",
           identifier: "MT-HTTP",
+          title: "Agent feed panel",
+          issue_url: "https://linear.app/example/MT-HTTP",
           state: "In Progress",
           session_id: "thread-http",
           turn_count: 8,
@@ -577,11 +606,53 @@ defmodule SymphonyElixir.ExtensionsTest do
               }
             }
           },
-          last_codex_timestamp: DateTime.utc_now(),
+          last_codex_timestamp: now,
+          recent_codex_events: [
+            %{
+              at: now,
+              kind: :doing_now,
+              label: "doing now",
+              text: "structured update",
+              source: "agent_message_content_delta",
+              importance: :normal,
+              status: :running,
+              streaming: true
+            },
+            %{
+              at: DateTime.add(now, -2, :second),
+              kind: :validation,
+              label: "validation",
+              text: "phpunit OK (2 tests)",
+              source: "exec_command_end",
+              importance: :normal,
+              status: :ok,
+              streaming: false
+            }
+          ],
+          current_activity: %{
+            at: now,
+            kind: :doing_now,
+            label: "doing now",
+            text: "structured update",
+            source: "agent_message_content_delta",
+            importance: :normal,
+            status: :running,
+            streaming: true
+          },
+          last_meaningful_update: %{
+            at: now,
+            kind: :doing_now,
+            label: "doing now",
+            text: "structured update",
+            source: "agent_message_content_delta",
+            importance: :normal,
+            status: :running,
+            streaming: true
+          },
           codex_input_tokens: 10,
           codex_output_tokens: 12,
           codex_total_tokens: 22,
-          started_at: DateTime.utc_now()
+          started_at: now
         }
       ])
 
@@ -592,8 +663,21 @@ defmodule SymphonyElixir.ExtensionsTest do
     StatusDashboard.notify_update()
 
     assert_eventually(fn ->
-      render(view) =~ "agent message content streaming: structured update"
+      html = render(view)
+
+      html =~ "agent message content streaming: structured update" and
+        html =~ "phpunit OK (2 tests)"
     end)
+
+    selected_html =
+      view
+      |> element("tr[phx-value-issue=\"MT-HTTP\"]")
+      |> render_click()
+
+    assert selected_html =~ "Issue details"
+    assert selected_html =~ "Live feed"
+    assert selected_html =~ "phpunit OK (2 tests)"
+    assert selected_html =~ ~s(<p class="feed-event-text">structured update</p>)
   end
 
   test "dashboard liveview renders an unavailable state without crashing" do
@@ -632,7 +716,9 @@ defmodule SymphonyElixir.ExtensionsTest do
       snapshot_timeout_ms: 50
     ]
 
-    start_supervised!({StaticOrchestrator, name: orchestrator_name, snapshot: snapshot, refresh: refresh})
+    start_supervised!(
+      {StaticOrchestrator, name: orchestrator_name, snapshot: snapshot, refresh: refresh}
+    )
 
     start_supervised!({HttpServer, server_opts})
 

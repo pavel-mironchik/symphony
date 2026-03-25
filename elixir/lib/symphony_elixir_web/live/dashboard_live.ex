@@ -10,10 +10,14 @@ defmodule SymphonyElixirWeb.DashboardLive do
 
   @impl true
   def mount(_params, _session, socket) do
+    payload = load_payload()
+
     socket =
       socket
-      |> assign(:payload, load_payload())
+      |> assign(:payload, payload)
       |> assign(:now, DateTime.utc_now())
+      |> assign(:selected_issue_identifier, nil)
+      |> assign(:selected_issue, nil)
 
     if connected?(socket) do
       :ok = ObservabilityPubSub.subscribe()
@@ -31,10 +35,31 @@ defmodule SymphonyElixirWeb.DashboardLive do
 
   @impl true
   def handle_info(:observability_updated, socket) do
+    payload = load_payload()
+
     {:noreply,
      socket
-     |> assign(:payload, load_payload())
+     |> assign(:payload, payload)
+     |> assign(
+       :selected_issue,
+       selected_issue_payload(payload, socket.assigns.selected_issue_identifier)
+     )
      |> assign(:now, DateTime.utc_now())}
+  end
+
+  @impl true
+  def handle_event("select_issue", %{"issue" => issue_identifier}, socket) do
+    {:noreply,
+     socket
+     |> assign(:selected_issue_identifier, issue_identifier)
+     |> assign(:selected_issue, selected_issue_payload(socket.assigns.payload, issue_identifier))}
+  end
+
+  def handle_event("close_issue_panel", _params, socket) do
+    {:noreply,
+     socket
+     |> assign(:selected_issue_identifier, nil)
+     |> assign(:selected_issue, nil)}
   end
 
   @impl true
@@ -149,11 +174,19 @@ defmodule SymphonyElixirWeb.DashboardLive do
                   </tr>
                 </thead>
                 <tbody>
-                  <tr :for={entry <- @payload.running}>
+                  <tr
+                    :for={entry <- @payload.running}
+                    class={["issue-row", @selected_issue_identifier == entry.issue_identifier && "issue-row-selected"]}
+                    phx-click="select_issue"
+                    phx-value-issue={entry.issue_identifier}
+                  >
                     <td>
                       <div class="issue-stack">
                         <span class="issue-id"><%= entry.issue_identifier %></span>
-                        <a class="issue-link" href={"/api/v1/#{entry.issue_identifier}"}>JSON details</a>
+                        <%= if entry.title do %>
+                          <span class="issue-title" title={entry.title}><%= entry.title %></span>
+                        <% end %>
+                        <a class="issue-link" href={"/api/v1/#{entry.issue_identifier}"} onclick="event.stopPropagation();">JSON details</a>
                       </div>
                     </td>
                     <td>
@@ -169,7 +202,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
                             class="subtle-button"
                             data-label="Copy ID"
                             data-copy={entry.session_id}
-                            onclick="navigator.clipboard.writeText(this.dataset.copy); this.textContent = 'Copied'; clearTimeout(this._copyTimer); this._copyTimer = setTimeout(() => { this.textContent = this.dataset.label }, 1200);"
+                            onclick="event.stopPropagation(); navigator.clipboard.writeText(this.dataset.copy); this.textContent = 'Copied'; clearTimeout(this._copyTimer); this._copyTimer = setTimeout(() => { this.textContent = this.dataset.label }, 1200);"
                           >
                             Copy ID
                           </button>
@@ -191,6 +224,17 @@ defmodule SymphonyElixirWeb.DashboardLive do
                             · <span class="mono numeric"><%= entry.last_event_at %></span>
                           <% end %>
                         </span>
+                        <%= if entry.secondary_update do %>
+                          <div class="agent-feed-line" title={entry.secondary_update.text}>
+                            <span class={agent_feed_badge_class(entry.secondary_update.kind)}>
+                              <%= entry.secondary_update.label %>
+                            </span>
+                            <span class="agent-feed-text"><%= entry.secondary_update.text %></span>
+                            <%= if entry.secondary_update.at do %>
+                              <span class="agent-feed-at mono"><%= format_event_time(entry.secondary_update.at) %></span>
+                            <% end %>
+                          </div>
+                        <% end %>
                       </div>
                     </td>
                     <td>
@@ -244,6 +288,158 @@ defmodule SymphonyElixirWeb.DashboardLive do
             </div>
           <% end %>
         </section>
+
+        <%= if @selected_issue do %>
+          <button
+            type="button"
+            class="issue-panel-backdrop"
+            phx-click="close_issue_panel"
+            aria-label="Close issue details"
+          >
+          </button>
+
+          <aside class="issue-panel" aria-label="Issue details">
+            <div class="issue-panel-header">
+              <div class="issue-panel-heading">
+                <p class="eyebrow">Issue details</p>
+                <h2 class="issue-panel-title"><%= @selected_issue.issue_identifier %></h2>
+                <%= if @selected_issue.title do %>
+                  <p class="issue-panel-copy"><%= @selected_issue.title %></p>
+                <% end %>
+              </div>
+
+              <button type="button" class="subtle-button issue-panel-close" phx-click="close_issue_panel">
+                Close
+              </button>
+            </div>
+
+            <div class="issue-panel-body">
+              <section class="issue-panel-section">
+                <div class="issue-panel-meta">
+                  <span class={state_badge_class(@selected_issue.state)}><%= @selected_issue.state %></span>
+                  <span class="muted">Runtime <%= format_runtime_and_turns(@selected_issue.started_at, @selected_issue.turn_count, @now) %></span>
+                  <span class="muted">Tokens <%= format_int(@selected_issue.tokens.total_tokens) %></span>
+                </div>
+                <div class="issue-panel-links">
+                  <%= if @selected_issue.issue_url do %>
+                    <a class="issue-link" href={@selected_issue.issue_url} target="_blank" rel="noreferrer">Linear</a>
+                  <% end %>
+                  <a class="issue-link" href={"/api/v1/#{@selected_issue.issue_identifier}"} target="_blank" rel="noreferrer">JSON details</a>
+                  <%= if @selected_issue.workspace_path do %>
+                    <button
+                      type="button"
+                      class="subtle-button"
+                      data-label="Copy workspace"
+                      data-copy={@selected_issue.workspace_path}
+                      onclick="navigator.clipboard.writeText(this.dataset.copy); this.textContent = 'Copied'; clearTimeout(this._copyTimer); this._copyTimer = setTimeout(() => { this.textContent = this.dataset.label }, 1200);"
+                    >
+                      Copy workspace
+                    </button>
+                  <% end %>
+                  <%= if @selected_issue.session_id do %>
+                    <button
+                      type="button"
+                      class="subtle-button"
+                      data-label="Copy session"
+                      data-copy={@selected_issue.session_id}
+                      onclick="navigator.clipboard.writeText(this.dataset.copy); this.textContent = 'Copied'; clearTimeout(this._copyTimer); this._copyTimer = setTimeout(() => { this.textContent = this.dataset.label }, 1200);"
+                    >
+                      Copy session
+                    </button>
+                  <% end %>
+                </div>
+              </section>
+
+              <section class="issue-panel-section">
+                <div class="issue-panel-section-header">
+                  <h3 class="section-title">Current status</h3>
+                  <p class="section-copy">Short operator-facing summary of what the agent is doing.</p>
+                </div>
+                <div class="issue-summary-grid">
+                  <article class="issue-summary-card">
+                    <p class="metric-label">Now</p>
+                    <%= if @selected_issue.current_activity do %>
+                      <div class="summary-event-stack">
+                        <span class={agent_feed_badge_class(@selected_issue.current_activity.kind)}><%= @selected_issue.current_activity.label %></span>
+                        <p class="summary-event-text"><%= @selected_issue.current_activity.text %></p>
+                      </div>
+                    <% else %>
+                      <p class="muted">No current activity yet.</p>
+                    <% end %>
+                  </article>
+
+                  <article class="issue-summary-card">
+                    <p class="metric-label">Latest meaningful update</p>
+                    <%= if @selected_issue.last_meaningful_update do %>
+                      <div class="summary-event-stack">
+                        <span class={agent_feed_badge_class(@selected_issue.last_meaningful_update.kind)}><%= @selected_issue.last_meaningful_update.label %></span>
+                        <p class="summary-event-text"><%= @selected_issue.last_meaningful_update.text %></p>
+                      </div>
+                    <% else %>
+                      <p class="muted">No meaningful updates yet.</p>
+                    <% end %>
+                  </article>
+
+                  <article class="issue-summary-card">
+                    <p class="metric-label">Last command</p>
+                    <%= if @selected_issue.last_command do %>
+                      <div class="summary-event-stack">
+                        <span class={agent_feed_badge_class(@selected_issue.last_command.kind)}><%= @selected_issue.last_command.label %></span>
+                        <p class="summary-event-text"><%= @selected_issue.last_command.text %></p>
+                      </div>
+                    <% else %>
+                      <p class="muted">No command activity captured.</p>
+                    <% end %>
+                  </article>
+
+                  <article class="issue-summary-card">
+                    <p class="metric-label">Last validation / blocker</p>
+                    <%= cond do %>
+                      <% @selected_issue.last_blocker -> %>
+                        <div class="summary-event-stack">
+                          <span class={agent_feed_badge_class(@selected_issue.last_blocker.kind)}><%= @selected_issue.last_blocker.label %></span>
+                          <p class="summary-event-text"><%= @selected_issue.last_blocker.text %></p>
+                        </div>
+                      <% @selected_issue.last_validation -> %>
+                        <div class="summary-event-stack">
+                          <span class={agent_feed_badge_class(@selected_issue.last_validation.kind)}><%= @selected_issue.last_validation.label %></span>
+                          <p class="summary-event-text"><%= @selected_issue.last_validation.text %></p>
+                        </div>
+                      <% true -> %>
+                        <p class="muted">No validation or blockers yet.</p>
+                    <% end %>
+                  </article>
+                </div>
+              </section>
+
+              <section class="issue-panel-section">
+                <div class="issue-panel-section-header">
+                  <h3 class="section-title">Live feed</h3>
+                  <p class="section-copy">Recent meaningful agent updates only; system chatter remains in the original Codex update field.</p>
+                </div>
+
+                <%= if @selected_issue.recent_events == [] do %>
+                  <p class="empty-state">No meaningful feed entries yet.</p>
+                <% else %>
+                  <div class="feed-timeline">
+                    <article class="feed-event" :for={event <- @selected_issue.recent_events}>
+                      <div class="feed-event-time mono"><%= format_event_time(event.at) %></div>
+                      <div class="feed-event-body">
+                        <div class="feed-event-header">
+                          <span class={agent_feed_badge_class(event.kind)}><%= event.label %></span>
+                          <%= if event.status do %>
+                            <span class={["feed-status", "feed-status-#{event.status}"]}><%= event.status %></span>
+                          <% end %>
+                        </div>
+                        <p class="feed-event-text"><%= event.text %></p>
+                      </div>
+                    </article>
+                  </div>
+                <% end %>
+              </section>
+            </div>
+          </aside>
+        <% end %>
       <% end %>
     </section>
     """
@@ -272,7 +468,8 @@ defmodule SymphonyElixirWeb.DashboardLive do
       end)
   end
 
-  defp format_runtime_and_turns(started_at, turn_count, now) when is_integer(turn_count) and turn_count > 0 do
+  defp format_runtime_and_turns(started_at, turn_count, now)
+       when is_integer(turn_count) and turn_count > 0 do
     "#{format_runtime_seconds(runtime_seconds_from_started_at(started_at, now))} / #{turn_count}"
   end
 
@@ -290,7 +487,8 @@ defmodule SymphonyElixirWeb.DashboardLive do
     DateTime.diff(now, started_at, :second)
   end
 
-  defp runtime_seconds_from_started_at(started_at, %DateTime{} = now) when is_binary(started_at) do
+  defp runtime_seconds_from_started_at(started_at, %DateTime{} = now)
+       when is_binary(started_at) do
     case DateTime.from_iso8601(started_at) do
       {:ok, parsed, _offset} -> runtime_seconds_from_started_at(parsed, now)
       _ -> 0
@@ -314,12 +512,56 @@ defmodule SymphonyElixirWeb.DashboardLive do
     normalized = state |> to_string() |> String.downcase()
 
     cond do
-      String.contains?(normalized, ["progress", "running", "active"]) -> "#{base} state-badge-active"
-      String.contains?(normalized, ["blocked", "error", "failed"]) -> "#{base} state-badge-danger"
-      String.contains?(normalized, ["todo", "queued", "pending", "retry"]) -> "#{base} state-badge-warning"
-      true -> base
+      String.contains?(normalized, ["progress", "running", "active"]) ->
+        "#{base} state-badge-active"
+
+      String.contains?(normalized, ["blocked", "error", "failed"]) ->
+        "#{base} state-badge-danger"
+
+      String.contains?(normalized, ["todo", "queued", "pending", "retry"]) ->
+        "#{base} state-badge-warning"
+
+      true ->
+        base
     end
   end
+
+  defp agent_feed_badge_class(kind) do
+    base = "agent-feed-badge"
+
+    case to_string(kind) do
+      "blocker" -> "#{base} agent-feed-badge-blocker"
+      "validation" -> "#{base} agent-feed-badge-validation"
+      "decision" -> "#{base} agent-feed-badge-decision"
+      "doing_now" -> "#{base} agent-feed-badge-doing-now"
+      "command" -> "#{base} agent-feed-badge-command"
+      "plan" -> "#{base} agent-feed-badge-plan"
+      _ -> base
+    end
+  end
+
+  defp selected_issue_payload(_payload, nil), do: nil
+
+  defp selected_issue_payload(payload, issue_identifier) when is_binary(issue_identifier) do
+    Enum.find(payload.running, &(&1.issue_identifier == issue_identifier))
+  end
+
+  defp selected_issue_payload(_payload, _issue_identifier), do: nil
+
+  defp format_event_time(nil), do: nil
+
+  defp format_event_time(%DateTime{} = datetime) do
+    Calendar.strftime(datetime, "%H:%M:%S")
+  end
+
+  defp format_event_time(datetime) when is_binary(datetime) do
+    case DateTime.from_iso8601(datetime) do
+      {:ok, parsed, _offset} -> format_event_time(parsed)
+      _ -> datetime
+    end
+  end
+
+  defp format_event_time(other), do: to_string(other)
 
   defp schedule_runtime_tick do
     Process.send_after(self(), :runtime_tick, @runtime_tick_ms)
