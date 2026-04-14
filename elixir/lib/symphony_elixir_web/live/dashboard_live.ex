@@ -5,6 +5,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
 
   use Phoenix.LiveView, layout: {SymphonyElixirWeb.Layouts, :app}
 
+  alias MapSet
   alias SymphonyElixirWeb.{Endpoint, ObservabilityPubSub, Presenter}
   @runtime_tick_ms 1_000
 
@@ -18,6 +19,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
       |> assign(:now, DateTime.utc_now())
       |> assign(:selected_issue_identifier, nil)
       |> assign(:selected_issue, nil)
+      |> assign(:expanded_feed_groups, MapSet.new())
 
     if connected?(socket) do
       :ok = ObservabilityPubSub.subscribe()
@@ -60,6 +62,17 @@ defmodule SymphonyElixirWeb.DashboardLive do
      socket
      |> assign(:selected_issue_identifier, nil)
      |> assign(:selected_issue, nil)}
+  end
+
+  def handle_event("toggle_feed_group", %{"group" => group_id}, socket) do
+    expanded =
+      if MapSet.member?(socket.assigns.expanded_feed_groups, group_id) do
+        MapSet.delete(socket.assigns.expanded_feed_groups, group_id)
+      else
+        MapSet.put(socket.assigns.expanded_feed_groups, group_id)
+      end
+
+    {:noreply, assign(socket, :expanded_feed_groups, expanded)}
   end
 
   @impl true
@@ -422,18 +435,61 @@ defmodule SymphonyElixirWeb.DashboardLive do
                   <p class="empty-state">No meaningful feed entries yet.</p>
                 <% else %>
                   <div class="feed-timeline">
-                    <article class="feed-event" :for={event <- @selected_issue.recent_events}>
-                      <div class="feed-event-time mono"><%= format_event_time(event.at) %></div>
-                      <div class="feed-event-body">
-                        <div class="feed-event-header">
-                          <span class={agent_feed_badge_class(event.kind)}><%= event.label %></span>
-                          <%= if event.status do %>
-                            <span class={["feed-status", "feed-status-#{event.status}"]}><%= event.status %></span>
-                          <% end %>
-                        </div>
-                        <p class="feed-event-text"><%= event.text %></p>
-                      </div>
-                    </article>
+                    <%= for entry <- grouped_feed_entries(@selected_issue.issue_identifier, @selected_issue.recent_events, @expanded_feed_groups) do %>
+                      <%= case entry.type do %>
+                        <% :event -> %>
+                          <article class="feed-event">
+                            <div class="feed-event-time mono"><%= format_event_time(entry.event.at) %></div>
+                            <div class="feed-event-body">
+                              <div class="feed-event-header">
+                                <span class={agent_feed_badge_class(entry.event.kind)}><%= entry.event.label %></span>
+                                <%= if entry.event.status do %>
+                                  <span class={["feed-status", "feed-status-#{entry.event.status}"]}><%= entry.event.status %></span>
+                                <% end %>
+                              </div>
+                              <p class="feed-event-text"><%= entry.event.text %></p>
+                            </div>
+                          </article>
+
+                        <% :command_group -> %>
+                          <article class="feed-event feed-event-command-group">
+                            <div class="feed-event-time mono"><%= format_feed_entry_time(entry) %></div>
+                            <div class="feed-event-body">
+                              <div class="command-group">
+                                <button
+                                  type="button"
+                                  class="command-group-toggle"
+                                  phx-click="toggle_feed_group"
+                                  phx-value-group={entry.id}
+                                >
+                                  <div class="feed-event-header">
+                                    <span class={agent_feed_badge_class(command_group_badge_kind(entry))}><%= command_group_label(entry) %></span>
+                                    <%= if entry.status do %>
+                                      <span class={["feed-status", "feed-status-#{entry.status}"]}><%= entry.status %></span>
+                                    <% end %>
+                                  </div>
+                                  <div class="command-group-summary-row">
+                                    <span class="command-group-copy"><%= command_group_copy(entry) %></span>
+                                    <span class="command-group-chevron" aria-hidden="true"><%= if entry.open?, do: "▾", else: "▸" %></span>
+                                  </div>
+                                </button>
+
+                                <div :if={entry.open?} class="command-group-events">
+                                  <article class="command-group-event" :for={event <- entry.events}>
+                                    <div class="command-group-event-header">
+                                      <span class="command-group-event-time mono"><%= format_event_time(event.at) %></span>
+                                      <%= if event.status do %>
+                                        <span class={["feed-status", "feed-status-#{event.status}"]}><%= event.status %></span>
+                                      <% end %>
+                                    </div>
+                                    <p class="feed-event-text"><%= event.text %></p>
+                                  </article>
+                                </div>
+                              </div>
+                            </div>
+                          </article>
+                      <% end %>
+                    <% end %>
                   </div>
                 <% end %>
               </section>
@@ -562,6 +618,117 @@ defmodule SymphonyElixirWeb.DashboardLive do
   end
 
   defp format_event_time(other), do: to_string(other)
+
+  defp grouped_feed_entries(issue_identifier, events, expanded_groups) when is_list(events) do
+    events
+    |> Enum.reduce([], fn event, acc ->
+      cond do
+        collapsible_feed_event?(event) ->
+          case acc do
+            [%{type: :command_group, events: existing} = group | rest] ->
+              [%{group | events: [event | existing]} | rest]
+
+            _ ->
+              [%{type: :command_group, events: [event]} | acc]
+          end
+
+        true ->
+          [%{type: :event, event: event} | acc]
+      end
+    end)
+    |> Enum.reverse()
+    |> Enum.map(&finalize_feed_entry(issue_identifier, &1, expanded_groups))
+  end
+
+  defp grouped_feed_entries(_issue_identifier, _events, _expanded_groups), do: []
+
+  defp collapsible_feed_event?(%{kind: kind}) when kind in ["command", :command, "validation", :validation], do: true
+
+  defp collapsible_feed_event?(%{kind: kind, source: source}) when kind in ["blocker", :blocker] do
+    command_derived_source?(source)
+  end
+
+  defp collapsible_feed_event?(_event), do: false
+
+  defp finalize_feed_entry(issue_identifier, %{type: :command_group, events: events} = entry, expanded_groups) do
+    statuses = Enum.map(events, &Map.get(&1, :status))
+
+    status =
+      cond do
+        Enum.any?(statuses, &(&1 == "error" or &1 == :error)) -> "error"
+        Enum.any?(statuses, &(&1 == "running" or &1 == :running)) -> "running"
+        Enum.any?(statuses, &(&1 == "ok" or &1 == :ok)) -> "ok"
+        true -> nil
+      end
+
+    group_id = feed_group_id(issue_identifier, events)
+
+    Map.merge(entry, %{
+      id: group_id,
+      events: events,
+      count: length(events),
+      started_at: events |> List.first() |> Map.get(:at),
+      finished_at: events |> List.last() |> Map.get(:at),
+      status: status,
+      open?: MapSet.member?(expanded_groups, group_id)
+    })
+  end
+
+  defp finalize_feed_entry(_issue_identifier, entry, _expanded_groups), do: entry
+
+  defp format_feed_entry_time(%{type: :command_group, started_at: started_at, finished_at: finished_at}) do
+    start_time = format_event_time(started_at)
+    finish_time = format_event_time(finished_at)
+
+    cond do
+      is_nil(start_time) -> finish_time
+      is_nil(finish_time) -> start_time
+      start_time == finish_time -> start_time
+      true -> "#{start_time}–#{finish_time}"
+    end
+  end
+
+  defp format_feed_entry_time(%{type: :event, event: event}), do: format_event_time(event.at)
+  defp format_feed_entry_time(_entry), do: nil
+
+  defp command_group_label(%{count: 1}), do: "terminal activity"
+  defp command_group_label(_entry), do: "terminal activity"
+
+  defp command_group_copy(%{count: 1}), do: "1 terminal update, click to expand"
+
+  defp command_group_copy(%{count: count}) when is_integer(count) do
+    "#{count} terminal updates, click to expand"
+  end
+
+  defp command_group_copy(_entry), do: "Terminal updates, click to expand"
+
+  defp command_group_badge_kind(%{status: status}) when status in ["error", :error], do: "blocker"
+  defp command_group_badge_kind(_entry), do: "command"
+
+  defp command_derived_source?(source) when is_binary(source) do
+    String.starts_with?(source, "exec_command_")
+  end
+
+  defp command_derived_source?(_source), do: false
+
+  defp feed_group_id(issue_identifier, events) do
+    signature =
+      events
+      |> Enum.map(fn event ->
+        [
+          to_string(Map.get(event, :kind)),
+          to_string(Map.get(event, :at)),
+          to_string(Map.get(event, :source)),
+          to_string(Map.get(event, :text)),
+          to_string(Map.get(event, :status))
+        ]
+        |> Enum.join("|")
+      end)
+      |> Enum.join("||")
+
+    digest = :crypto.hash(:sha256, signature) |> Base.encode16(case: :lower)
+    "#{issue_identifier || "issue"}:#{digest}"
+  end
 
   defp schedule_runtime_tick do
     Process.send_after(self(), :runtime_tick, @runtime_tick_ms)

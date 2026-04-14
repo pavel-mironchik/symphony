@@ -261,8 +261,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert_receive {:graphql_called, state_lookup_query, %{issueId: "issue-1", stateName: "Done"}}
     assert state_lookup_query =~ "states"
 
-    assert_receive {:graphql_called, update_issue_query,
-                    %{issueId: "issue-1", stateId: "state-1"}}
+    assert_receive {:graphql_called, update_issue_query, %{issueId: "issue-1", stateId: "state-1"}}
 
     assert update_issue_query =~ "issueUpdate"
 
@@ -364,8 +363,7 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "last_validation" => nil,
                  "last_blocker" => nil,
                  "recent_events" => [],
-                 "started_at" =>
-                   state_payload["running"] |> List.first() |> Map.fetch!("started_at"),
+                 "started_at" => state_payload["running"] |> List.first() |> Map.fetch!("started_at"),
                  "last_event_at" => nil,
                  "tokens" => %{"input_tokens" => 4, "output_tokens" => 8, "total_tokens" => 12}
                }
@@ -680,6 +678,165 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert selected_html =~ ~s(<p class="feed-event-text">structured update</p>)
   end
 
+  test "dashboard liveview groups command events into a collapsible feed block" do
+    orchestrator_name = Module.concat(__MODULE__, :DashboardGroupedCommandsOrchestrator)
+    now = DateTime.utc_now()
+
+    snapshot =
+      static_snapshot()
+      |> Map.put(:running, [
+        %{
+          issue_id: "issue-http",
+          identifier: "MT-HTTP",
+          title: "Agent feed grouped commands",
+          issue_url: "https://linear.app/example/MT-HTTP",
+          state: "In Progress",
+          session_id: "thread-http",
+          turn_count: 8,
+          last_codex_event: :notification,
+          last_codex_message: %{
+            event: :notification,
+            message: %{
+              payload: %{
+                "method" => "codex/event/agent_message_content_delta",
+                "params" => %{
+                  "msg" => %{
+                    "content" => "Thinking through the next API change"
+                  }
+                }
+              }
+            }
+          },
+          last_codex_timestamp: now,
+          recent_codex_events: [
+            %{
+              at: now,
+              kind: :doing_now,
+              label: "doing now",
+              text: "Thinking through the next API change",
+              source: "agent_message_content_delta",
+              importance: :normal,
+              status: :running,
+              streaming: true
+            },
+            %{
+              at: DateTime.add(now, -1, :second),
+              kind: :blocker,
+              label: "blocker",
+              text: "git diff --check → exit 1",
+              source: "exec_command_end",
+              importance: :high,
+              status: :error,
+              streaming: false
+            },
+            %{
+              at: DateTime.add(now, -2, :second),
+              kind: :validation,
+              label: "validation",
+              text: "mix test → exit 0",
+              source: "exec_command_end",
+              importance: :normal,
+              status: :ok,
+              streaming: false
+            },
+            %{
+              at: DateTime.add(now, -3, :second),
+              kind: :command,
+              label: "command",
+              text: "git diff --stat",
+              source: "exec_command_end",
+              importance: :normal,
+              status: :ok,
+              streaming: false
+            },
+            %{
+              at: DateTime.add(now, -4, :second),
+              kind: :command,
+              label: "command",
+              text: "git status --short",
+              source: "exec_command_begin",
+              importance: :normal,
+              status: :running,
+              streaming: false
+            },
+            %{
+              at: DateTime.add(now, -5, :second),
+              kind: :decision,
+              label: "decision",
+              text: "Need to keep the feed readable while preserving detail",
+              source: "agent_reasoning",
+              importance: :normal,
+              status: nil,
+              streaming: false
+            }
+          ],
+          current_activity: %{
+            at: now,
+            kind: :doing_now,
+            label: "doing now",
+            text: "Thinking through the next API change",
+            source: "agent_message_content_delta",
+            importance: :normal,
+            status: :running,
+            streaming: true
+          },
+          last_meaningful_update: %{
+            at: now,
+            kind: :doing_now,
+            label: "doing now",
+            text: "Thinking through the next API change",
+            source: "agent_message_content_delta",
+            importance: :normal,
+            status: :running,
+            streaming: true
+          },
+          codex_input_tokens: 10,
+          codex_output_tokens: 12,
+          codex_total_tokens: 22,
+          started_at: now
+        }
+      ])
+
+    start_supervised!({StaticOrchestrator, name: orchestrator_name, snapshot: snapshot, refresh: %{queued: false, coalesced: false, requested_at: now, operations: ["poll"]}})
+
+    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
+
+    {:ok, view, _html} = live(build_conn(), "/")
+
+    selected_html =
+      view
+      |> element("tr[phx-value-issue=\"MT-HTTP\"]")
+      |> render_click()
+
+    assert selected_html =~ "Thinking through the next API change"
+    assert selected_html =~ "Need to keep the feed readable while preserving detail"
+    assert selected_html =~ "4 terminal updates, click to expand"
+    refute selected_html =~ ~s(class="command-group-events")
+    assert selected_html =~ "git diff --check → exit 1"
+    assert selected_html =~ ~s(class="command-group-toggle")
+    assert selected_html =~ "feed-status-error"
+
+    expanded_html =
+      view
+      |> element("button.command-group-toggle")
+      |> render_click()
+
+    assert expanded_html =~ ~s(class="command-group-events")
+    assert expanded_html =~ "git status --short"
+    assert expanded_html =~ "git diff --stat"
+    assert expanded_html =~ "mix test → exit 0"
+    assert expanded_html =~ "git diff --check → exit 1"
+    assert expanded_html =~ "▾"
+
+    send(view.pid, :runtime_tick)
+    Process.sleep(20)
+
+    rerendered_html = render(view)
+
+    assert rerendered_html =~ "git status --short"
+    assert rerendered_html =~ "git diff --check → exit 1"
+  end
+
   test "dashboard liveview renders an unavailable state without crashing" do
     start_test_endpoint(
       orchestrator: Module.concat(__MODULE__, :MissingDashboardOrchestrator),
@@ -716,9 +873,7 @@ defmodule SymphonyElixir.ExtensionsTest do
       snapshot_timeout_ms: 50
     ]
 
-    start_supervised!(
-      {StaticOrchestrator, name: orchestrator_name, snapshot: snapshot, refresh: refresh}
-    )
+    start_supervised!({StaticOrchestrator, name: orchestrator_name, snapshot: snapshot, refresh: refresh})
 
     start_supervised!({HttpServer, server_opts})
 

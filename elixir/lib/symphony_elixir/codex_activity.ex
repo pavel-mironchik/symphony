@@ -538,8 +538,7 @@ defmodule SymphonyElixir.CodexActivity do
         {command_kind(text), command_label(text), :running, :normal, false}
 
       method in @command_end_methods ->
-        {command_end_kind(update, text), command_end_label(update, text),
-         command_end_status(update), command_end_importance(update), false}
+        {command_end_kind(update, text), command_end_label(update, text), command_end_status(update), command_end_importance(update), false}
 
       method == "item/tool/requestUserInput" ->
         {:blocker, "blocker", :error, :high, false}

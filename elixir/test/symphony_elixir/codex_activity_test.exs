@@ -8,21 +8,11 @@ defmodule SymphonyElixir.CodexActivityTest do
 
     running_entry =
       blank_running_entry()
-      |> CodexActivity.integrate_running_entry(
-        agent_delta_update("item/agentMessage/delta", "Human", now)
-      )
-      |> CodexActivity.integrate_running_entry(
-        agent_delta_update("agent_message_delta", "Human", now)
-      )
-      |> CodexActivity.integrate_running_entry(
-        agent_delta_update("agent_message_content_delta", "Human", now)
-      )
-      |> CodexActivity.integrate_running_entry(
-        agent_delta_update("item/agentMessage/delta", " review", DateTime.add(now, 1, :second))
-      )
-      |> CodexActivity.integrate_running_entry(
-        agent_delta_update("agent_message_delta", " review", DateTime.add(now, 1, :second))
-      )
+      |> CodexActivity.integrate_running_entry(agent_delta_update("item/agentMessage/delta", "Human", now))
+      |> CodexActivity.integrate_running_entry(agent_delta_update("agent_message_delta", "Human", now))
+      |> CodexActivity.integrate_running_entry(agent_delta_update("agent_message_content_delta", "Human", now))
+      |> CodexActivity.integrate_running_entry(agent_delta_update("item/agentMessage/delta", " review", DateTime.add(now, 1, :second)))
+      |> CodexActivity.integrate_running_entry(agent_delta_update("agent_message_delta", " review", DateTime.add(now, 1, :second)))
       |> CodexActivity.integrate_running_entry(
         agent_delta_update(
           "agent_message_content_delta",
@@ -30,9 +20,7 @@ defmodule SymphonyElixir.CodexActivityTest do
           DateTime.add(now, 1, :second)
         )
       )
-      |> CodexActivity.integrate_running_entry(
-        agent_delta_update("item/agentMessage/delta", " blocker", DateTime.add(now, 2, :second))
-      )
+      |> CodexActivity.integrate_running_entry(agent_delta_update("item/agentMessage/delta", " blocker", DateTime.add(now, 2, :second)))
 
     assert [event] = CodexActivity.recent_events(running_entry)
     assert event.kind == :doing_now
@@ -47,9 +35,7 @@ defmodule SymphonyElixir.CodexActivityTest do
     running_entry =
       blank_running_entry()
       |> CodexActivity.integrate_running_entry(command_begin_update("git status --short", now))
-      |> CodexActivity.integrate_running_entry(
-        command_end_update(0, DateTime.add(now, 1, :second))
-      )
+      |> CodexActivity.integrate_running_entry(command_end_update(0, DateTime.add(now, 1, :second)))
 
     assert [event | _rest] = CodexActivity.recent_events(running_entry)
     assert event.kind == :command

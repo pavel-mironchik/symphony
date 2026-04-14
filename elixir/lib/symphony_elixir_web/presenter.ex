@@ -203,8 +203,7 @@ defmodule SymphonyElixirWeb.Presenter do
   defp running_summary_payload(running) do
     %{
       current_activity: feed_event_payload(CodexActivity.current_activity(running)),
-      latest_meaningful_update:
-        feed_event_payload(CodexActivity.latest_meaningful_event(running)),
+      latest_meaningful_update: feed_event_payload(CodexActivity.latest_meaningful_event(running)),
       secondary_update: secondary_update_payload(running),
       last_command: feed_event_payload(CodexActivity.latest_event(running, [:command])),
       last_validation: feed_event_payload(CodexActivity.latest_event(running, [:validation])),
