@@ -468,6 +468,79 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert snapshot.rate_limits == rate_limits
   end
 
+  test "snapshot surfaces live Codex rate limits from account/rateLimits/updated notifications" do
+    issue_id = "issue-rate-limits-live"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-221A",
+      title: "Rate limits live",
+      description: "Track live Codex rate limits",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-221A"
+    }
+
+    orchestrator_name = Module.concat(__MODULE__, :RateLimitNotificationOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+    started_at = DateTime.utc_now()
+
+    running_entry = %{
+      pid: self(),
+      ref: make_ref(),
+      identifier: issue.identifier,
+      issue: issue,
+      session_id: nil,
+      last_codex_message: nil,
+      last_codex_timestamp: nil,
+      last_codex_event: nil,
+      codex_input_tokens: 0,
+      codex_output_tokens: 0,
+      codex_total_tokens: 0,
+      codex_last_reported_input_tokens: 0,
+      codex_last_reported_output_tokens: 0,
+      codex_last_reported_total_tokens: 0,
+      started_at: started_at
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.put(initial_state.claimed, issue_id))
+    end)
+
+    rate_limits = %{
+      "limitId" => "codex_pro",
+      "limitName" => "Codex Pro",
+      "primary" => %{"usedPercent" => 55.0, "windowDurationMins" => 5},
+      "secondary" => nil,
+      "credits" => %{"hasCredits" => true, "balance" => 12.5}
+    }
+
+    send(
+      pid,
+      {:codex_worker_update, issue_id,
+       %{
+         event: :notification,
+         payload: %{
+           "method" => "account/rateLimits/updated",
+           "params" => %{"rateLimits" => rate_limits}
+         },
+         timestamp: DateTime.utc_now()
+       }}
+    )
+
+    snapshot = GenServer.call(pid, :snapshot)
+    assert snapshot.rate_limits == rate_limits
+  end
+
   test "orchestrator token accounting prefers total_token_usage over last_token_usage in token_count payloads" do
     issue_id = "issue-token-precedence"
 
@@ -1054,6 +1127,26 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert checking_rendered =~ "checking now…"
   end
 
+  test "status dashboard renders auth pause reason when orchestration is paused" do
+    paused_snapshot =
+      {:ok,
+       %{
+         running: [],
+         retrying: [],
+         codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+         rate_limits: nil,
+         auth_pause: %{
+           code: "token_expired",
+           issue_identifier: "MT-570",
+           detected_at: DateTime.utc_now()
+         },
+         polling: %{checking?: false, next_poll_in_ms: 2_000, poll_interval_ms: 30_000}
+       }}
+
+    rendered = StatusDashboard.format_snapshot_content_for_test(paused_snapshot, 0.0)
+    assert rendered =~ "paused — auth failed: token_expired (MT-570)"
+  end
+
   test "status dashboard adds a spacer line before backoff queue when no agents are active" do
     snapshot_data =
       {:ok,
@@ -1375,10 +1468,22 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
            "item" => %{
              "id" => "item-1234567890abcdef",
              "type" => "commandExecution",
-             "status" => "running"
+             "status" => "running",
+             "command" => "git status --short"
            }
          }
-       }, "item started: command execution"},
+       }, "command started: git status --short"},
+      {"item/completed",
+       %{
+         "params" => %{
+           "item" => %{
+             "type" => "commandExecution",
+             "status" => "completed",
+             "command" => "git status --short",
+             "exitCode" => 0
+           }
+         }
+       }, "command completed: git status --short → exit 0"},
       {"item/completed", %{"params" => %{"item" => %{"type" => "fileChange", "status" => "completed"}}}, "item completed: file change"},
       {"item/agentMessage/delta", %{"params" => %{"delta" => "hello"}}, "agent message streaming"},
       {"item/plan/delta", %{"params" => %{"delta" => "step"}}, "plan streaming"},

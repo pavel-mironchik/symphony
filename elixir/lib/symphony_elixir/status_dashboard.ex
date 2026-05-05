@@ -335,7 +335,7 @@ defmodule SymphonyElixir.StatusDashboard do
       {:ok, %{running: running, retrying: retrying, codex_totals: codex_totals} = snapshot} ->
         rate_limits = Map.get(snapshot, :rate_limits)
         project_link_lines = format_project_link_lines()
-        project_refresh_line = format_project_refresh_line(Map.get(snapshot, :polling))
+        project_refresh_line = format_project_refresh_line(Map.get(snapshot, :polling), Map.get(snapshot, :auth_pause))
         codex_input_tokens = Map.get(codex_totals, :input_tokens, 0)
         codex_output_tokens = Map.get(codex_totals, :output_tokens, 0)
         codex_total_tokens = Map.get(codex_totals, :total_tokens, 0)
@@ -384,7 +384,7 @@ defmodule SymphonyElixir.StatusDashboard do
           colorize("│ Orchestrator snapshot unavailable", @ansi_red),
           colorize("│ Throughput: ", @ansi_bold) <> colorize("#{format_tps(tps)} tps", @ansi_cyan),
           format_project_link_lines(),
-          format_project_refresh_line(nil),
+          format_project_refresh_line(nil, nil),
           closing_border()
         ]
         |> List.flatten()
@@ -413,17 +413,30 @@ defmodule SymphonyElixir.StatusDashboard do
     end
   end
 
-  defp format_project_refresh_line(%{checking?: true}) do
+  defp format_project_refresh_line(_polling, %{code: code} = auth_pause) when is_binary(code) do
+    identifier = Map.get(auth_pause, :issue_identifier)
+
+    suffix =
+      case identifier do
+        value when is_binary(value) and value != "" -> " (#{value})"
+        _ -> ""
+      end
+
+    colorize("│ Next refresh: ", @ansi_bold) <>
+      colorize("paused — auth failed: #{code}#{suffix}", @ansi_red)
+  end
+
+  defp format_project_refresh_line(%{checking?: true}, _auth_pause) do
     colorize("│ Next refresh: ", @ansi_bold) <> colorize("checking now…", @ansi_cyan)
   end
 
-  defp format_project_refresh_line(%{next_poll_in_ms: due_in_ms}) when is_integer(due_in_ms) do
+  defp format_project_refresh_line(%{next_poll_in_ms: due_in_ms}, _auth_pause) when is_integer(due_in_ms) do
     due_in_ms = max(due_in_ms, 0)
     seconds = div(due_in_ms + 999, 1000)
     colorize("│ Next refresh: ", @ansi_bold) <> colorize("#{seconds}s", @ansi_cyan)
   end
 
-  defp format_project_refresh_line(_) do
+  defp format_project_refresh_line(_, _auth_pause) do
     colorize("│ Next refresh: ", @ansi_bold) <> colorize("n/a", @ansi_gray)
   end
 
@@ -1324,6 +1337,16 @@ defmodule SymphonyElixir.StatusDashboard do
   defp humanize_codex_method("item/commandExecution/outputDelta", payload),
     do: humanize_streaming_event("command output streaming", payload)
 
+  defp humanize_codex_method("item/commandExecution/terminalInteraction", payload) do
+    command = extract_command(payload)
+
+    if is_binary(command) and String.trim(command) != "" do
+      "command interaction: #{command}"
+    else
+      "command interaction"
+    end
+  end
+
   defp humanize_codex_method("item/fileChange/outputDelta", payload),
     do: humanize_streaming_event("file change output streaming", payload)
 
@@ -1438,17 +1461,23 @@ defmodule SymphonyElixir.StatusDashboard do
         map_path(payload, [:params, :item]) ||
         %{}
 
-    item_type = item |> map_value(["type", :type]) |> humanize_item_type()
-    item_status = map_value(item, ["status", :status])
-    item_id = map_value(item, ["id", :id])
+    case map_value(item, ["type", :type]) do
+      "commandExecution" ->
+        humanize_command_item_lifecycle(state, item)
 
-    details =
-      []
-      |> append_if_present(short_id(item_id))
-      |> append_if_present(humanize_status(item_status))
+      _ ->
+        item_type = item |> map_value(["type", :type]) |> humanize_item_type()
+        item_status = map_value(item, ["status", :status])
+        item_id = map_value(item, ["id", :id])
 
-    detail_suffix = if details == [], do: "", else: " (#{Enum.join(details, ", ")})"
-    "item #{state}: #{item_type}#{detail_suffix}"
+        details =
+          []
+          |> append_if_present(short_id(item_id))
+          |> append_if_present(humanize_status(item_status))
+
+        detail_suffix = if details == [], do: "", else: " (#{Enum.join(details, ", ")})"
+        "item #{state}: #{item_type}#{detail_suffix}"
+    end
   end
 
   defp humanize_codex_wrapper_event("mcp_startup_update", payload) do
@@ -1716,8 +1745,10 @@ defmodule SymphonyElixir.StatusDashboard do
   end
 
   defp fallback_command(nil, payload) do
-    map_path(payload, ["params", "command"]) ||
+    map_path(payload, ["params", "item", "command"]) ||
+      map_path(payload, ["params", "command"]) ||
       map_path(payload, ["params", "cmd"]) ||
+      map_path(payload, ["params", "stdin"]) ||
       map_path(payload, ["params", "argv"]) ||
       map_path(payload, ["params", "args"])
   end
@@ -1725,7 +1756,7 @@ defmodule SymphonyElixir.StatusDashboard do
   defp fallback_command(command, _payload), do: command
 
   defp normalize_command(%{} = command) do
-    binary_command = map_value(command, ["parsedCmd", :parsedCmd, "command", :command, "cmd", :cmd])
+    binary_command = map_value(command, ["parsedCmd", :parsedCmd, "command", :command, "cmd", :cmd, "stdin", :stdin])
     args = map_value(command, ["args", :args, "argv", :argv])
 
     if is_binary(binary_command) and is_list(args) do
@@ -1748,6 +1779,35 @@ defmodule SymphonyElixir.StatusDashboard do
   end
 
   defp normalize_command(_command), do: nil
+
+  defp humanize_command_item_lifecycle(state, item) do
+    command =
+      item
+      |> map_value(["command", :command])
+      |> normalize_command()
+
+    exit_code = map_value(item, ["exitCode", :exitCode, "exit_code", :exit_code])
+
+    case {state, command, exit_code} do
+      {"started", command, _} when is_binary(command) ->
+        "command started: #{command}"
+
+      {"completed", command, code} when is_binary(command) and is_integer(code) ->
+        "command completed: #{command} → exit #{code}"
+
+      {"completed", command, _} when is_binary(command) ->
+        "command completed: #{command}"
+
+      {"started", _, _} ->
+        "command started"
+
+      {"completed", _, _} ->
+        "command completed"
+
+      _ ->
+        "command #{state}"
+    end
+  end
 
   defp humanize_item_type(nil), do: "item"
 

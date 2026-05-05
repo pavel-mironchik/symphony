@@ -23,6 +23,8 @@ defmodule SymphonyElixir.CodexActivity do
     "agent_message_content_delta"
   ]
   @plan_methods ["item/plan/delta", "turn/plan/updated"]
+  @command_item_begin_methods ["item/started"]
+  @command_item_end_methods ["item/completed"]
   @command_begin_methods ["exec_command_begin"]
   @command_end_methods ["exec_command_end"]
   @ignored_methods [
@@ -30,8 +32,6 @@ defmodule SymphonyElixir.CodexActivity do
     "turn/completed",
     "thread/started",
     "thread/tokenUsage/updated",
-    "item/started",
-    "item/completed",
     "item/commandExecution/outputDelta",
     "item/fileChange/outputDelta",
     "item/reasoning/textDelta",
@@ -78,10 +78,10 @@ defmodule SymphonyElixir.CodexActivity do
       stream_category(method) != nil ->
         integrate_stream_update(running_entry, update, payload, method, timestamp)
 
-      method in @command_begin_methods ->
+      command_begin_event?(method, payload) ->
         handle_command_begin(running_entry, update, payload, method, timestamp)
 
-      method in @command_end_methods ->
+      command_end_event?(method, payload) ->
         handle_command_end(running_entry, update, payload, method, timestamp)
 
       true ->
@@ -214,7 +214,7 @@ defmodule SymphonyElixir.CodexActivity do
         kind: command_kind(text),
         label: command_label(text),
         text: text,
-        source: normalize_source(method, Map.get(update, :event)),
+        source: "command",
         importance: :normal,
         status: :running,
         streaming: false
@@ -235,7 +235,7 @@ defmodule SymphonyElixir.CodexActivity do
         kind: command_end_kind(update, text),
         label: command_end_label(update, text),
         text: text,
-        source: normalize_source(method, Map.get(update, :event)),
+        source: "command",
         importance: command_end_importance(update),
         status: status,
         streaming: false
@@ -397,16 +397,13 @@ defmodule SymphonyElixir.CodexActivity do
   defp command_completion_text(running_entry, update, payload, method) do
     completion = feed_text(update, payload, method)
     command_text = Map.get(running_entry, :last_running_command_text)
+    exit_code = command_exit_code(payload)
 
     case {command_text, command_end_status(update)} do
       {command, :ok} when is_binary(command) and command != "" ->
         truncate_text("#{command} → exit 0")
 
       {command, :error} when is_binary(command) and command != "" ->
-        exit_code =
-          map_path(payload, ["params", "msg", "exit_code"]) ||
-            map_path(payload, ["params", "msg", "exitCode"])
-
         if is_integer(exit_code) do
           truncate_text("#{command} → exit #{exit_code}")
         else
@@ -446,6 +443,11 @@ defmodule SymphonyElixir.CodexActivity do
     humanized = humanized_text(update)
 
     cond do
+      command_item_event?(method, payload) ->
+        payload
+        |> extract_command_text()
+        |> fallback_text(strip_feed_prefix(humanized))
+
       method in @agent_message_methods ->
         payload
         |> extract_delta_preview()
@@ -516,11 +518,18 @@ defmodule SymphonyElixir.CodexActivity do
   end
 
   defp classify_by_method(update, text) do
-    method = extract_method(Map.get(update, :payload) || %{})
+    payload = Map.get(update, :payload) || %{}
+    method = extract_method(payload)
 
     cond do
       is_nil(method) or text == "" ->
         :ignore
+
+      command_begin_event?(method, payload) ->
+        {command_kind(text), command_label(text), :running, :normal, false}
+
+      command_end_event?(method, payload) ->
+        {command_end_kind(update, text), command_end_label(update, text), command_end_status(update), command_end_importance(update), false}
 
       method in @ignored_methods ->
         :ignore
@@ -533,12 +542,6 @@ defmodule SymphonyElixir.CodexActivity do
 
       method in @plan_methods ->
         {:plan, "plan", :running, :normal, String.ends_with?(method, "/delta")}
-
-      method in @command_begin_methods ->
-        {command_kind(text), command_label(text), :running, :normal, false}
-
-      method in @command_end_methods ->
-        {command_end_kind(update, text), command_end_label(update, text), command_end_status(update), command_end_importance(update), false}
 
       method == "item/tool/requestUserInput" ->
         {:blocker, "blocker", :error, :high, false}
@@ -583,14 +586,14 @@ defmodule SymphonyElixir.CodexActivity do
 
   defp command_end_status(update) do
     payload = Map.get(update, :payload) || %{}
-
-    exit_code =
-      map_path(payload, ["params", "msg", "exit_code"]) ||
-        map_path(payload, ["params", "msg", "exitCode"])
+    exit_code = command_exit_code(payload)
+    item_status = command_item_status(payload)
 
     cond do
       is_integer(exit_code) and exit_code == 0 -> :ok
       is_integer(exit_code) -> :error
+      item_status in ["completed", "success", "succeeded", "ok"] -> :ok
+      item_status in ["failed", "error", "cancelled", "canceled", "rejected"] -> :error
       true -> nil
     end
   end
@@ -757,7 +760,9 @@ defmodule SymphonyElixir.CodexActivity do
   defp normalize_source(method, _event) when method in @plan_methods, do: "plan_update"
 
   defp normalize_source(method, _event)
-       when method in @command_begin_methods or method in @command_end_methods, do: "command"
+       when method in @command_begin_methods or method in @command_end_methods or
+              method in @command_item_begin_methods or method in @command_item_end_methods,
+       do: "command"
 
   defp normalize_source(method, _event) when is_binary(method), do: method
   defp normalize_source(_method, event) when is_atom(event), do: Atom.to_string(event)
@@ -821,4 +826,58 @@ defmodule SymphonyElixir.CodexActivity do
       ArgumentError -> false
     end
   end
+
+  defp command_begin_event?(method, payload) do
+    method in @command_begin_methods ||
+      (method in @command_item_begin_methods and command_item_payload?(payload))
+  end
+
+  defp command_end_event?(method, payload) do
+    method in @command_end_methods ||
+      (method in @command_item_end_methods and command_item_payload?(payload))
+  end
+
+  defp command_item_event?(method, payload) do
+    command_begin_event?(method, payload) || command_end_event?(method, payload)
+  end
+
+  defp command_item_payload?(payload) when is_map(payload) do
+    case map_path(payload, ["params", "item", "type"]) do
+      type when is_binary(type) -> type == "commandExecution"
+      _ -> false
+    end
+  end
+
+  defp command_item_payload?(_payload), do: false
+
+  defp command_item_status(payload) when is_map(payload) do
+    map_path(payload, ["params", "item", "status"])
+  end
+
+  defp command_item_status(_payload), do: nil
+
+  defp command_exit_code(payload) when is_map(payload) do
+    map_path(payload, ["params", "msg", "exit_code"]) ||
+      map_path(payload, ["params", "msg", "exitCode"]) ||
+      map_path(payload, ["params", "item", "exit_code"]) ||
+      map_path(payload, ["params", "item", "exitCode"])
+  end
+
+  defp command_exit_code(_payload), do: nil
+
+  defp extract_command_text(payload) when is_map(payload) do
+    extract_first_present_raw(payload, [
+      ["params", "item", "command"],
+      ["params", "parsedCmd"],
+      ["params", "command"],
+      ["params", "cmd"],
+      ["params", "stdin"],
+      ["params", "msg", "command"],
+      ["params", "msg", "parsedCmd"],
+      ["params", "msg", "cmd"]
+    ])
+    |> normalize_text()
+  end
+
+  defp extract_command_text(_payload), do: ""
 end

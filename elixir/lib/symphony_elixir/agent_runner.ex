@@ -20,6 +20,11 @@ defmodule SymphonyElixir.AgentRunner do
       :ok ->
         :ok
 
+      {:error, {:auth_failed, details}} ->
+        Logger.error("Agent run auth failed for #{issue_context(issue)} worker_host=#{worker_host_for_log(worker_host)}: #{inspect(details)}")
+
+        exit({:auth_failed, details})
+
       {:error, reason} ->
         Logger.error("Agent run failed for #{issue_context(issue)}: #{inspect(reason)}")
         raise RuntimeError, "Agent run failed for #{issue_context(issue)}: #{inspect(reason)}"

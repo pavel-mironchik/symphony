@@ -758,6 +758,87 @@ defmodule SymphonyElixir.CoreTest do
     assert_due_in_range(due_at_ms, 9_000, 10_500)
   end
 
+  test "auth failure pauses orchestration, clears retries, and stops other runs" do
+    issue_id = "issue-auth-pause"
+    ref = make_ref()
+    other_issue_id = "issue-auth-other"
+    other_pid = spawn(fn -> Process.sleep(:infinity) end)
+    other_ref = Process.monitor(other_pid)
+    retry_timer = Process.send_after(self(), :auth_pause_retry_timer, 60_000)
+    orchestrator_name = Module.concat(__MODULE__, :AuthPauseOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      Process.cancel_timer(retry_timer)
+
+      if Process.alive?(other_pid) do
+        Process.exit(other_pid, :kill)
+      end
+
+      receive do
+        :auth_pause_retry_timer -> :ok
+      after
+        0 -> :ok
+      end
+
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+
+    running_entry = %{
+      pid: self(),
+      ref: ref,
+      identifier: "MT-570",
+      issue: %Issue{id: issue_id, identifier: "MT-570", state: "In Progress"},
+      started_at: DateTime.utc_now()
+    }
+
+    other_running_entry = %{
+      pid: other_pid,
+      ref: other_ref,
+      identifier: "MT-571",
+      issue: %Issue{id: other_issue_id, identifier: "MT-571", state: "In Progress"},
+      started_at: DateTime.utc_now()
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{
+        issue_id => running_entry,
+        other_issue_id => other_running_entry
+      })
+      |> Map.put(:claimed, MapSet.new([issue_id, other_issue_id, "issue-auth-retry"]))
+      |> Map.put(:retry_attempts, %{
+        "issue-auth-retry" => %{
+          attempt: 2,
+          timer_ref: retry_timer,
+          retry_token: make_ref(),
+          due_at_ms: System.monotonic_time(:millisecond) + 60_000,
+          identifier: "MT-572",
+          error: "agent exited: :boom"
+        }
+      })
+    end)
+
+    send(pid, {:DOWN, ref, :process, self(), {:auth_failed, %{code: "token_expired", message: "Provided authentication token is expired", raw: "token_expired"}}})
+    Process.sleep(100)
+    state = :sys.get_state(pid)
+
+    assert state.running == %{}
+    assert state.retry_attempts == %{}
+    assert state.claimed == MapSet.new()
+    refute Process.alive?(other_pid)
+
+    assert %{
+             code: "token_expired",
+             issue_id: ^issue_id,
+             issue_identifier: "MT-570"
+           } = state.auth_pause
+  end
+
   test "stale retry timer messages do not consume newer retry entries" do
     issue_id = "issue-stale-retry"
     orchestrator_name = Module.concat(__MODULE__, :StaleRetryOrchestrator)

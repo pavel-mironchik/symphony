@@ -43,6 +43,20 @@ defmodule SymphonyElixir.CodexActivityTest do
     assert event.text == "git status --short → exit 0"
   end
 
+  test "tracks commandExecution item lifecycle from new Codex CLI notifications" do
+    now = DateTime.utc_now()
+
+    running_entry =
+      blank_running_entry()
+      |> CodexActivity.integrate_running_entry(command_item_update("item/started", "git status --short", "running", nil, now))
+      |> CodexActivity.integrate_running_entry(command_item_update("item/completed", "git status --short", "completed", 0, DateTime.add(now, 1, :second)))
+
+    assert [event | _rest] = CodexActivity.recent_events(running_entry)
+    assert event.kind == :command
+    assert event.source == "command"
+    assert event.text == "git status --short → exit 0"
+  end
+
   defp blank_running_entry do
     %{
       recent_codex_events: [],
@@ -80,6 +94,31 @@ defmodule SymphonyElixir.CodexActivityTest do
       payload: %{
         "method" => "codex/event/exec_command_end",
         "params" => %{"msg" => %{"exit_code" => exit_code}}
+      }
+    }
+  end
+
+  defp command_item_update(method, command, status, exit_code, timestamp) do
+    item = %{
+      "id" => "item-cmd-1",
+      "type" => "commandExecution",
+      "status" => status,
+      "command" => command
+    }
+
+    item =
+      if is_integer(exit_code) do
+        Map.put(item, "exitCode", exit_code)
+      else
+        item
+      end
+
+    %{
+      event: :notification,
+      timestamp: timestamp,
+      payload: %{
+        "method" => method,
+        "params" => %{"item" => item}
       }
     }
   end

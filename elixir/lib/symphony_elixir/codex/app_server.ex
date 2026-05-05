@@ -116,6 +116,18 @@ defmodule SymphonyElixir.Codex.AppServer do
                turn_id: turn_id
              }}
 
+          {:error, {:auth_failed, details}} ->
+            Logger.error("Codex auth failed for #{issue_context(issue)} session_id=#{session_id}: #{format_auth_failure_for_log(details)}")
+
+            emit_message(
+              on_message,
+              :auth_failure,
+              %{details: details, raw: Map.get(details, :raw), payload: Map.get(details, :message)},
+              metadata
+            )
+
+            {:error, {:auth_failed, details}}
+
           {:error, reason} ->
             Logger.warning("Codex session ended with error for #{issue_context(issue)} session_id=#{session_id}: #{inspect(reason)}")
 
@@ -379,7 +391,10 @@ defmodule SymphonyElixir.Codex.AppServer do
           Map.get(payload, "params")
         )
 
-        {:error, {:turn_failed, Map.get(payload, "params")}}
+        case auth_failure_details(Map.get(payload, "params") || payload) do
+          %{} = details -> {:error, {:auth_failed, details}}
+          _ -> {:error, {:turn_failed, Map.get(payload, "params")}}
+        end
 
       {:ok, %{"method" => "turn/cancelled", "params" => _} = payload} ->
         emit_turn_event(
@@ -420,21 +435,28 @@ defmodule SymphonyElixir.Codex.AppServer do
         receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
 
       {:error, _reason} ->
-        log_non_json_stream_line(payload_string, "turn stream")
+        case auth_failure_details(payload_string) do
+          %{} = details ->
+            Logger.error("Codex turn stream auth failure: #{format_auth_failure_for_log(details)}")
+            {:error, {:auth_failed, details}}
 
-        if protocol_message_candidate?(payload_string) do
-          emit_message(
-            on_message,
-            :malformed,
-            %{
-              payload: payload_string,
-              raw: payload_string
-            },
-            metadata_from_message(port, %{raw: payload_string})
-          )
+          _ ->
+            log_non_json_stream_line(payload_string, "turn stream")
+
+            if protocol_message_candidate?(payload_string) do
+              emit_message(
+                on_message,
+                :malformed,
+                %{
+                  payload: payload_string,
+                  raw: payload_string
+                },
+                metadata_from_message(port, %{raw: payload_string})
+              )
+            end
+
+            receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
         end
-
-        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
     end
   end
 
@@ -945,21 +967,42 @@ defmodule SymphonyElixir.Codex.AppServer do
 
     case Jason.decode(payload) do
       {:ok, %{"id" => ^request_id, "error" => error}} ->
-        {:error, {:response_error, error}}
+        case auth_failure_details(error) do
+          %{} = details ->
+            Logger.error("Codex response auth failure: #{format_auth_failure_for_log(details)}")
+            {:error, {:auth_failed, details}}
+
+          _ ->
+            {:error, {:response_error, error}}
+        end
 
       {:ok, %{"id" => ^request_id, "result" => result}} ->
         {:ok, result}
 
       {:ok, %{"id" => ^request_id} = response_payload} ->
-        {:error, {:response_error, response_payload}}
+        case auth_failure_details(response_payload) do
+          %{} = details ->
+            Logger.error("Codex response auth failure: #{format_auth_failure_for_log(details)}")
+            {:error, {:auth_failed, details}}
+
+          _ ->
+            {:error, {:response_error, response_payload}}
+        end
 
       {:ok, %{} = other} ->
         Logger.debug("Ignoring message while waiting for response: #{inspect(other)}")
         with_timeout_response(port, request_id, timeout_ms, "")
 
       {:error, _} ->
-        log_non_json_stream_line(payload, "response stream")
-        with_timeout_response(port, request_id, timeout_ms, "")
+        case auth_failure_details(payload) do
+          %{} = details ->
+            Logger.error("Codex response stream auth failure: #{format_auth_failure_for_log(details)}")
+            {:error, {:auth_failed, details}}
+
+          _ ->
+            log_non_json_stream_line(payload, "response stream")
+            with_timeout_response(port, request_id, timeout_ms, "")
+        end
     end
   end
 
@@ -1026,6 +1069,70 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp maybe_set_usage(metadata, _payload), do: metadata
+
+  defp auth_failure_details(term) do
+    term
+    |> auth_failure_strings()
+    |> Enum.find_value(&auth_failure_from_text/1)
+  end
+
+  defp auth_failure_strings(term) when is_binary(term), do: [term]
+  defp auth_failure_strings(term) when is_atom(term), do: [Atom.to_string(term)]
+  defp auth_failure_strings(term) when is_integer(term), do: [Integer.to_string(term)]
+
+  defp auth_failure_strings(term) when is_list(term) do
+    Enum.flat_map(term, &auth_failure_strings/1)
+  end
+
+  defp auth_failure_strings(term) when is_map(term) do
+    Enum.flat_map(term, fn {key, value} ->
+      auth_failure_strings(key) ++ auth_failure_strings(value)
+    end)
+  end
+
+  defp auth_failure_strings(_term), do: []
+
+  defp auth_failure_from_text(text) when is_binary(text) do
+    normalized = String.downcase(text)
+
+    cond do
+      String.contains?(normalized, "refresh_token_reused") ->
+        auth_failure_payload("refresh_token_reused", text)
+
+      String.contains?(normalized, "token_expired") or
+        String.contains?(normalized, "authentication token is expired") or
+          String.contains?(normalized, "authentication token has expired") ->
+        auth_failure_payload("token_expired", text)
+
+      String.contains?(normalized, "401 unauthorized") and
+          (String.contains?(normalized, "auth") or String.contains?(normalized, "token") or
+             String.contains?(normalized, "backend-api/codex")) ->
+        auth_failure_payload("401 Unauthorized", text)
+
+      true ->
+        nil
+    end
+  end
+
+  defp auth_failure_from_text(_text), do: nil
+
+  defp auth_failure_payload(code, text) do
+    trimmed = text |> to_string() |> String.trim()
+
+    %{
+      code: code,
+      message: String.slice(trimmed, 0, 240),
+      raw: String.slice(trimmed, 0, 1_000)
+    }
+  end
+
+  defp format_auth_failure_for_log(details) when is_map(details) do
+    code = Map.get(details, :code, "auth_failed")
+    message = Map.get(details, :message, "unknown auth failure")
+    "#{code}: #{message}"
+  end
+
+  defp format_auth_failure_for_log(details), do: inspect(details)
 
   defp shell_escape(value) when is_binary(value) do
     "'" <> String.replace(value, "'", "'\"'\"'") <> "'"

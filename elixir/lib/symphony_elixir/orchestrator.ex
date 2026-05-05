@@ -40,7 +40,8 @@ defmodule SymphonyElixir.Orchestrator do
       claimed: MapSet.new(),
       retry_attempts: %{},
       codex_totals: nil,
-      codex_rate_limits: nil
+      codex_rate_limits: nil,
+      auth_pause: nil
     ]
   end
 
@@ -64,7 +65,8 @@ defmodule SymphonyElixir.Orchestrator do
       tick_timer_ref: nil,
       tick_token: nil,
       codex_totals: @empty_codex_totals,
-      codex_rate_limits: nil
+      codex_rate_limits: nil,
+      auth_pause: nil
     }
 
     run_terminal_workspace_cleanup(:startup)
@@ -112,8 +114,16 @@ defmodule SymphonyElixir.Orchestrator do
 
   def handle_info(:run_poll_cycle, state) do
     state = refresh_runtime_config(state)
-    state = maybe_run_terminal_workspace_cleanup(state)
-    state = maybe_dispatch(state)
+
+    state =
+      if auth_pause_active?(state) do
+        state
+      else
+        state
+        |> maybe_run_terminal_workspace_cleanup()
+        |> maybe_dispatch()
+      end
+
     state = schedule_tick(state, state.poll_interval_ms)
     state = %{state | poll_check_in_progress: false}
 
@@ -135,8 +145,21 @@ defmodule SymphonyElixir.Orchestrator do
         session_id = running_entry_session_id(running_entry)
 
         state =
-          case reason do
-            :normal ->
+          cond do
+            auth_failure_reason?(reason) ->
+              pause_due_to_auth(
+                clear_issue_tracking(state, issue_id),
+                issue_id,
+                running_entry,
+                auth_failure_details_from_reason(reason)
+              )
+
+            auth_pause_active?(state) ->
+              Logger.warning("Suppressing retry because orchestrator is paused due to Codex auth failure: issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}")
+
+              clear_issue_tracking(state, issue_id)
+
+            reason == :normal ->
               Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling active-state continuation check")
 
               state
@@ -148,7 +171,7 @@ defmodule SymphonyElixir.Orchestrator do
                 workspace_path: Map.get(running_entry, :workspace_path)
               })
 
-            _ ->
+            true ->
               Logger.warning("Agent task exited for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}; scheduling retry")
 
               next_attempt = next_retry_attempt_from_running(running_entry)
@@ -227,53 +250,57 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp maybe_dispatch(%State{} = state) do
-    state = reconcile_running_issues(state)
-
-    with :ok <- Config.validate!(),
-         {:ok, issues} <- Tracker.fetch_candidate_issues(),
-         true <- available_slots(state) > 0 do
-      choose_issues(issues, state)
+    if auth_pause_active?(state) do
+      state
     else
-      {:error, :missing_linear_api_token} ->
-        Logger.error("Linear API token missing in WORKFLOW.md")
-        state
+      state = reconcile_running_issues(state)
 
-      {:error, :missing_linear_project_slug} ->
-        Logger.error("Linear project slug missing in WORKFLOW.md")
-        state
+      with :ok <- Config.validate!(),
+           {:ok, issues} <- Tracker.fetch_candidate_issues(),
+           true <- available_slots(state) > 0 do
+        choose_issues(issues, state)
+      else
+        {:error, :missing_linear_api_token} ->
+          Logger.error("Linear API token missing in WORKFLOW.md")
+          state
 
-      {:error, :missing_tracker_kind} ->
-        Logger.error("Tracker kind missing in WORKFLOW.md")
+        {:error, :missing_linear_project_slug} ->
+          Logger.error("Linear project slug missing in WORKFLOW.md")
+          state
 
-        state
+        {:error, :missing_tracker_kind} ->
+          Logger.error("Tracker kind missing in WORKFLOW.md")
 
-      {:error, {:unsupported_tracker_kind, kind}} ->
-        Logger.error("Unsupported tracker kind in WORKFLOW.md: #{inspect(kind)}")
+          state
 
-        state
+        {:error, {:unsupported_tracker_kind, kind}} ->
+          Logger.error("Unsupported tracker kind in WORKFLOW.md: #{inspect(kind)}")
 
-      {:error, {:invalid_workflow_config, message}} ->
-        Logger.error("Invalid WORKFLOW.md config: #{message}")
-        state
+          state
 
-      {:error, {:missing_workflow_file, path, reason}} ->
-        Logger.error("Missing WORKFLOW.md at #{path}: #{inspect(reason)}")
-        state
+        {:error, {:invalid_workflow_config, message}} ->
+          Logger.error("Invalid WORKFLOW.md config: #{message}")
+          state
 
-      {:error, :workflow_front_matter_not_a_map} ->
-        Logger.error("Failed to parse WORKFLOW.md: workflow front matter must decode to a map")
-        state
+        {:error, {:missing_workflow_file, path, reason}} ->
+          Logger.error("Missing WORKFLOW.md at #{path}: #{inspect(reason)}")
+          state
 
-      {:error, {:workflow_parse_error, reason}} ->
-        Logger.error("Failed to parse WORKFLOW.md: #{inspect(reason)}")
-        state
+        {:error, :workflow_front_matter_not_a_map} ->
+          Logger.error("Failed to parse WORKFLOW.md: workflow front matter must decode to a map")
+          state
 
-      {:error, reason} ->
-        Logger.error("Failed to fetch from Linear: #{inspect(reason)}")
-        state
+        {:error, {:workflow_parse_error, reason}} ->
+          Logger.error("Failed to parse WORKFLOW.md: #{inspect(reason)}")
+          state
 
-      false ->
-        state
+        {:error, reason} ->
+          Logger.error("Failed to fetch from Linear: #{inspect(reason)}")
+          state
+
+        false ->
+          state
+      end
     end
   end
 
@@ -1178,6 +1205,7 @@ defmodule SymphonyElixir.Orchestrator do
        retrying: retrying,
        codex_totals: state.codex_totals,
        rate_limits: Map.get(state, :codex_rate_limits),
+       auth_pause: Map.get(state, :auth_pause),
        polling: %{
          checking?: state.poll_check_in_progress == true,
          next_poll_in_ms: next_poll_in_ms(state.next_poll_due_at_ms, now_ms),
@@ -1356,6 +1384,77 @@ defmodule SymphonyElixir.Orchestrator do
     }
   end
 
+  defp auth_pause_active?(%State{auth_pause: auth_pause}) when is_map(auth_pause), do: true
+  defp auth_pause_active?(_state), do: false
+
+  defp auth_failure_reason?({:auth_failed, details}) when is_map(details), do: true
+  defp auth_failure_reason?(_reason), do: false
+
+  defp auth_failure_details_from_reason({:auth_failed, details}) when is_map(details), do: details
+  defp auth_failure_details_from_reason(reason), do: %{code: "auth_failed", message: inspect(reason), raw: inspect(reason)}
+
+  defp clear_issue_tracking(%State{} = state, issue_id) when is_binary(issue_id) do
+    %{
+      state
+      | claimed: MapSet.delete(state.claimed, issue_id),
+        retry_attempts: Map.delete(state.retry_attempts, issue_id)
+    }
+  end
+
+  defp clear_issue_tracking(%State{} = state, _issue_id), do: state
+
+  defp clear_all_retry_attempts(%State{} = state) do
+    Enum.each(state.retry_attempts, fn
+      {_issue_id, %{timer_ref: timer_ref}} when is_reference(timer_ref) ->
+        Process.cancel_timer(timer_ref)
+
+      _ ->
+        :ok
+    end)
+
+    %{state | retry_attempts: %{}}
+  end
+
+  defp pause_due_to_auth(%State{} = state, issue_id, running_entry, details)
+       when is_binary(issue_id) and is_map(details) do
+    if auth_pause_active?(state) do
+      state
+    else
+      identifier = Map.get(running_entry, :identifier, issue_id)
+      session_id = running_entry_session_id(running_entry)
+      code = Map.get(details, :code, "auth_failed")
+      message = Map.get(details, :message, "Codex authentication failed")
+
+      Logger.error("Pausing orchestrator due to Codex auth failure: issue_id=#{issue_id} issue_identifier=#{identifier} session_id=#{session_id} code=#{code} message=#{message}")
+
+      auth_pause = %{
+        code: code,
+        message: message,
+        raw: Map.get(details, :raw),
+        issue_id: issue_id,
+        issue_identifier: identifier,
+        session_id: session_id,
+        detected_at: DateTime.utc_now()
+      }
+
+      state
+      |> clear_all_retry_attempts()
+      |> terminate_all_running_issues()
+      |> Map.put(:claimed, MapSet.new())
+      |> Map.put(:auth_pause, auth_pause)
+    end
+  end
+
+  defp pause_due_to_auth(%State{} = state, _issue_id, _running_entry, _details), do: state
+
+  defp terminate_all_running_issues(%State{} = state) do
+    state.running
+    |> Map.keys()
+    |> Enum.reduce(state, fn running_issue_id, state_acc ->
+      terminate_running_issue(state_acc, running_issue_id, false)
+    end)
+  end
+
   defp cleanup_terminal_issue_workspaces(issues) when is_list(issues) do
     Enum.each(issues, fn
       %Issue{identifier: identifier} when is_binary(identifier) ->
@@ -1491,6 +1590,8 @@ defmodule SymphonyElixir.Orchestrator do
     rate_limits_from_payload(update[:rate_limits]) ||
       rate_limits_from_payload(Map.get(update, "rate_limits")) ||
       rate_limits_from_payload(Map.get(update, :rate_limits)) ||
+      rate_limits_from_payload(update[:rateLimits]) ||
+      rate_limits_from_payload(Map.get(update, "rateLimits")) ||
       rate_limits_from_payload(update[:payload]) ||
       rate_limits_from_payload(Map.get(update, "payload")) ||
       rate_limits_from_payload(update)
@@ -1530,7 +1631,11 @@ defmodule SymphonyElixir.Orchestrator do
   defp turn_completed_usage_from_payload(_payload), do: nil
 
   defp rate_limits_from_payload(payload) when is_map(payload) do
-    direct = Map.get(payload, "rate_limits") || Map.get(payload, :rate_limits)
+    direct =
+      Map.get(payload, "rate_limits") ||
+        Map.get(payload, :rate_limits) ||
+        Map.get(payload, "rateLimits") ||
+        Map.get(payload, :rateLimits)
 
     cond do
       rate_limits_map?(direct) ->
@@ -1583,7 +1688,11 @@ defmodule SymphonyElixir.Orchestrator do
       Map.get(payload, "limit_id") ||
         Map.get(payload, :limit_id) ||
         Map.get(payload, "limit_name") ||
-        Map.get(payload, :limit_name)
+        Map.get(payload, :limit_name) ||
+        Map.get(payload, "limitId") ||
+        Map.get(payload, :limitId) ||
+        Map.get(payload, "limitName") ||
+        Map.get(payload, :limitName)
 
     has_buckets =
       Enum.any?(

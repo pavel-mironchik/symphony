@@ -20,7 +20,8 @@ defmodule SymphonyElixirWeb.Presenter do
           running: Enum.map(snapshot.running, &running_entry_payload/1),
           retrying: Enum.map(snapshot.retrying, &retry_entry_payload/1),
           codex_totals: snapshot.codex_totals,
-          rate_limits: snapshot.rate_limits
+          rate_limits: snapshot.rate_limits,
+          auth_pause: auth_pause_payload(Map.get(snapshot, :auth_pause))
         }
 
       :timeout ->
@@ -103,6 +104,19 @@ defmodule SymphonyElixirWeb.Presenter do
   defp issue_status(_running, nil), do: "running"
   defp issue_status(nil, _retry), do: "retrying"
   defp issue_status(_running, _retry), do: "running"
+
+  defp auth_pause_payload(%{} = auth_pause) do
+    %{
+      code: Map.get(auth_pause, :code),
+      message: Map.get(auth_pause, :message),
+      issue_id: Map.get(auth_pause, :issue_id),
+      issue_identifier: Map.get(auth_pause, :issue_identifier),
+      session_id: Map.get(auth_pause, :session_id),
+      detected_at: iso8601(Map.get(auth_pause, :detected_at))
+    }
+  end
+
+  defp auth_pause_payload(_auth_pause), do: nil
 
   defp running_entry_payload(entry) do
     %{
