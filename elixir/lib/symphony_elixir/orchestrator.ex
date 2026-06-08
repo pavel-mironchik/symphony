@@ -40,6 +40,7 @@ defmodule SymphonyElixir.Orchestrator do
       claimed: MapSet.new(),
       blocked: %{},
       retry_attempts: %{},
+      workspace_bootstraps: %{},
       codex_totals: nil,
       codex_rate_limits: nil,
       auth_pause: nil
@@ -142,6 +143,7 @@ defmodule SymphonyElixir.Orchestrator do
 
       issue_id ->
         {running_entry, state} = pop_running_entry(state, issue_id)
+        state = release_workspace_bootstrap(state, running_entry)
         state = record_session_completion_totals(state, running_entry)
         session_id = running_entry_session_id(running_entry)
 
@@ -161,13 +163,16 @@ defmodule SymphonyElixir.Orchestrator do
         {:noreply, state}
 
       running_entry ->
+        state = release_workspace_bootstrap(state, running_entry)
+
         updated_running_entry =
           running_entry
           |> maybe_put_runtime_value(:worker_host, runtime_info[:worker_host])
           |> maybe_put_runtime_value(:workspace_path, runtime_info[:workspace_path])
+          |> Map.delete(:workspace_bootstrap_key)
 
         notify_dashboard()
-        {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
+        {:noreply, %{state | running: Map.put(state.running, issue_id, updated_running_entry)}}
     end
   end
 
@@ -582,7 +587,11 @@ defmodule SymphonyElixir.Orchestrator do
         release_issue_claim(state, issue_id)
 
       %{pid: pid, ref: ref, identifier: identifier} = running_entry ->
-        state = record_session_completion_totals(state, running_entry)
+        state =
+          state
+          |> release_workspace_bootstrap(running_entry)
+          |> record_session_completion_totals(running_entry)
+
         worker_host = Map.get(running_entry, :worker_host)
 
         if cleanup_workspace do
@@ -772,7 +781,10 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp stop_and_block_issue(%State{} = state, issue_id, running_entry, error) do
     stop_running_task(Map.get(running_entry, :pid), Map.get(running_entry, :ref))
-    block_issue_from_entry(state, issue_id, running_entry, error)
+
+    state
+    |> release_workspace_bootstrap(running_entry)
+    |> block_issue_from_entry(issue_id, running_entry, error)
   end
 
   defp block_issue_from_entry(%State{} = state, issue_id, running_entry, error) do
@@ -978,11 +990,33 @@ defmodule SymphonyElixir.Orchestrator do
         state
 
       worker_host ->
-        spawn_issue_on_worker_host(state, issue, attempt, recipient, worker_host)
+        dispatch_issue_on_bootstrap_gate(state, issue, attempt, recipient, worker_host)
     end
   end
 
-  defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host) do
+  defp dispatch_issue_on_bootstrap_gate(%State{} = state, issue, attempt, recipient, worker_host) do
+    case workspace_bootstrap_status(state, issue, worker_host) do
+      {:ready, workspace_bootstrap_key} ->
+        spawn_issue_on_worker_host(state, issue, attempt, recipient, worker_host, workspace_bootstrap_key)
+
+      {:busy, workspace_bootstrap_key} ->
+        Logger.debug("Deferring fresh workspace bootstrap for #{issue_context(issue)} worker_host=#{worker_host || "local"} bootstrap_key=#{inspect(workspace_bootstrap_key)}")
+        maybe_retry_deferred_bootstrap(state, issue, attempt, worker_host)
+
+      {:error, reason} ->
+        Logger.warning("Skipping dispatch; workspace status check failed for #{issue_context(issue)} worker_host=#{worker_host || "local"}: #{inspect(reason)}")
+        maybe_retry_workspace_status_failure(state, issue, attempt, worker_host, reason)
+    end
+  end
+
+  defp spawn_issue_on_worker_host(
+         %State{} = state,
+         issue,
+         attempt,
+         recipient,
+         worker_host,
+         workspace_bootstrap_key
+       ) do
     case Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, fn ->
            AgentRunner.run(issue, recipient, attempt: attempt, worker_host: worker_host)
          end) do
@@ -991,8 +1025,8 @@ defmodule SymphonyElixir.Orchestrator do
 
         Logger.info("Dispatching issue to agent: #{issue_context(issue)} pid=#{inspect(pid)} attempt=#{inspect(attempt)} worker_host=#{worker_host || "local"}")
 
-        running =
-          Map.put(state.running, issue.id, %{
+        running_entry =
+          %{
             pid: pid,
             ref: ref,
             identifier: issue.identifier,
@@ -1016,13 +1050,15 @@ defmodule SymphonyElixir.Orchestrator do
             turn_count: 0,
             retry_attempt: normalize_retry_attempt(attempt),
             started_at: DateTime.utc_now()
-          })
+          }
+          |> maybe_put_runtime_value(:workspace_bootstrap_key, workspace_bootstrap_key)
 
         %{
           state
-          | running: running,
+          | running: Map.put(state.running, issue.id, running_entry),
             claimed: MapSet.put(state.claimed, issue.id),
-            retry_attempts: Map.delete(state.retry_attempts, issue.id)
+            retry_attempts: Map.delete(state.retry_attempts, issue.id),
+            workspace_bootstraps: claim_workspace_bootstrap(state.workspace_bootstraps, workspace_bootstrap_key, issue)
         }
 
       {:error, reason} ->
@@ -1035,6 +1071,89 @@ defmodule SymphonyElixir.Orchestrator do
           error: "failed to spawn agent: #{inspect(reason)}",
           worker_host: worker_host
         })
+    end
+  end
+
+  defp workspace_bootstrap_status(%State{} = state, issue, worker_host) do
+    case Workspace.status_for_issue(issue, worker_host) do
+      {:ok, %{exists?: true}} ->
+        {:ready, nil}
+
+      {:ok, %{exists?: false, bootstrap_key: bootstrap_key}} ->
+        if Map.has_key?(state.workspace_bootstraps, bootstrap_key) do
+          {:busy, bootstrap_key}
+        else
+          {:ready, bootstrap_key}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp claim_workspace_bootstrap(workspace_bootstraps, nil, _issue), do: workspace_bootstraps
+
+  defp claim_workspace_bootstrap(workspace_bootstraps, workspace_bootstrap_key, %Issue{} = issue)
+       when is_map(workspace_bootstraps) do
+    Map.put(workspace_bootstraps, workspace_bootstrap_key, %{
+      issue_id: issue.id,
+      issue_identifier: issue.identifier,
+      started_at: DateTime.utc_now()
+    })
+  end
+
+  defp release_workspace_bootstrap(%State{} = state, running_entry) when is_map(running_entry) do
+    workspace_bootstrap_key = Map.get(running_entry, :workspace_bootstrap_key)
+    issue_id = running_entry_issue_id(running_entry)
+
+    cond do
+      is_nil(workspace_bootstrap_key) ->
+        state
+
+      bootstrap_claimed_by_issue?(state.workspace_bootstraps, workspace_bootstrap_key, issue_id) ->
+        %{state | workspace_bootstraps: Map.delete(state.workspace_bootstraps, workspace_bootstrap_key)}
+
+      true ->
+        state
+    end
+  end
+
+  defp release_workspace_bootstrap(%State{} = state, _running_entry), do: state
+
+  defp bootstrap_claimed_by_issue?(workspace_bootstraps, workspace_bootstrap_key, issue_id)
+       when is_map(workspace_bootstraps) do
+    case Map.get(workspace_bootstraps, workspace_bootstrap_key) do
+      %{issue_id: ^issue_id} when is_binary(issue_id) -> true
+      _ -> false
+    end
+  end
+
+  defp running_entry_issue_id(%{issue: %Issue{id: issue_id}}) when is_binary(issue_id), do: issue_id
+  defp running_entry_issue_id(_running_entry), do: nil
+
+  defp maybe_retry_deferred_bootstrap(%State{} = state, %Issue{} = issue, attempt, worker_host) do
+    if is_integer(attempt) do
+      schedule_issue_retry(state, issue.id, attempt + 1, %{
+        identifier: issue.identifier,
+        issue_url: issue.url,
+        error: "workspace bootstrap gate busy",
+        worker_host: worker_host
+      })
+    else
+      state
+    end
+  end
+
+  defp maybe_retry_workspace_status_failure(%State{} = state, %Issue{} = issue, attempt, worker_host, reason) do
+    if is_integer(attempt) do
+      schedule_issue_retry(state, issue.id, attempt + 1, %{
+        identifier: issue.identifier,
+        issue_url: issue.url,
+        error: "workspace status check failed: #{inspect(reason)}",
+        worker_host: worker_host
+      })
+    else
+      state
     end
   end
 

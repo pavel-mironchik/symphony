@@ -7,8 +7,45 @@ defmodule SymphonyElixir.Workspace do
   alias SymphonyElixir.{Config, PathSafety, SSH}
 
   @remote_workspace_marker "__SYMPHONY_WORKSPACE__"
+  @remote_workspace_status_marker "__SYMPHONY_WORKSPACE_STATUS__"
 
   @type worker_host :: String.t() | nil
+  @type workspace_status :: %{
+          path: Path.t(),
+          exists?: boolean(),
+          bootstrap_key: {String.t() | :local, String.t()}
+        }
+
+  @spec status_for_issue(map() | String.t() | nil, worker_host()) ::
+          {:ok, workspace_status()} | {:error, term()}
+  def status_for_issue(issue_or_identifier, worker_host \\ nil) do
+    issue_context = issue_context(issue_or_identifier)
+
+    try do
+      safe_id = safe_identifier(issue_context.issue_identifier)
+
+      with {:ok, workspace} <- workspace_path_for_issue(safe_id, worker_host),
+           :ok <- validate_workspace_path(workspace, worker_host),
+           {:ok, exists?} <- workspace_exists?(workspace, worker_host) do
+        {:ok,
+         %{
+           path: workspace,
+           exists?: exists?,
+           bootstrap_key: bootstrap_key(worker_host)
+         }}
+      end
+    rescue
+      error in [ArgumentError, ErlangError, File.Error] ->
+        Logger.error("Workspace status check failed #{issue_log_context(issue_context)} worker_host=#{worker_host_for_log(worker_host)} error=#{Exception.message(error)}")
+        {:error, error}
+    end
+  end
+
+  @spec bootstrap_key(worker_host()) :: {String.t() | :local, String.t()}
+  def bootstrap_key(worker_host \\ nil)
+
+  def bootstrap_key(nil), do: {:local, Config.settings!().workspace.root}
+  def bootstrap_key(worker_host) when is_binary(worker_host), do: {worker_host, Config.settings!().workspace.root}
 
   @spec create_for_issue(map() | String.t() | nil, worker_host()) ::
           {:ok, Path.t()} | {:error, term()}
@@ -20,9 +57,15 @@ defmodule SymphonyElixir.Workspace do
 
       with {:ok, workspace} <- workspace_path_for_issue(safe_id, worker_host),
            :ok <- validate_workspace_path(workspace, worker_host),
-           {:ok, workspace, created?} <- ensure_workspace(workspace, worker_host),
-           :ok <- maybe_run_after_create_hook(workspace, issue_context, created?, worker_host) do
-        {:ok, workspace}
+           {:ok, workspace, created?} <- ensure_workspace(workspace, worker_host) do
+        case maybe_run_after_create_hook(workspace, issue_context, created?, worker_host) do
+          :ok ->
+            {:ok, workspace}
+
+          {:error, reason} ->
+            cleanup_failed_fresh_workspace(workspace, created?, worker_host)
+            {:error, reason}
+        end
       end
     rescue
       error in [ArgumentError, ErlangError, File.Error] ->
@@ -83,6 +126,68 @@ defmodule SymphonyElixir.Workspace do
     File.mkdir_p!(workspace)
     {:ok, workspace, true}
   end
+
+  defp workspace_exists?(workspace, nil) do
+    {:ok, File.dir?(workspace)}
+  end
+
+  defp workspace_exists?(workspace, worker_host) when is_binary(worker_host) do
+    script =
+      [
+        "set -eu",
+        remote_shell_assign("workspace", workspace),
+        "if [ -d \"$workspace\" ]; then",
+        "  exists=1",
+        "else",
+        "  exists=0",
+        "fi",
+        "printf '%s\\t%s\\n' '#{@remote_workspace_status_marker}' \"$exists\""
+      ]
+      |> Enum.join("\n")
+
+    case run_remote_command(worker_host, script, Config.settings!().hooks.timeout_ms) do
+      {:ok, {output, 0}} ->
+        parse_remote_workspace_status_output(output)
+
+      {:ok, {output, status}} ->
+        {:error, {:workspace_status_failed, worker_host, status, output}}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp cleanup_failed_fresh_workspace(workspace, true, nil) do
+    Logger.warning("Removing incomplete fresh workspace after bootstrap failure workspace=#{workspace} worker_host=local")
+    File.rm_rf(workspace)
+    :ok
+  end
+
+  defp cleanup_failed_fresh_workspace(workspace, true, worker_host) when is_binary(worker_host) do
+    Logger.warning("Removing incomplete fresh workspace after bootstrap failure workspace=#{workspace} worker_host=#{worker_host}")
+
+    script =
+      [
+        remote_shell_assign("workspace", workspace),
+        "rm -rf \"$workspace\""
+      ]
+      |> Enum.join("\n")
+
+    case run_remote_command(worker_host, script, Config.settings!().hooks.timeout_ms) do
+      {:ok, {_output, 0}} ->
+        :ok
+
+      {:ok, {output, status}} ->
+        Logger.warning("Failed to remove incomplete remote workspace worker_host=#{worker_host} workspace=#{workspace} status=#{status} output=#{inspect(sanitize_hook_output_for_log(output))}")
+
+      {:error, reason} ->
+        Logger.warning("Failed to remove incomplete remote workspace worker_host=#{worker_host} workspace=#{workspace} error=#{inspect(reason)}")
+    end
+
+    :ok
+  end
+
+  defp cleanup_failed_fresh_workspace(_workspace, false, _worker_host), do: :ok
 
   @spec remove(Path.t()) :: {:ok, [String.t()]} | {:error, term(), String.t()}
   def remove(workspace), do: remove(workspace, nil)
@@ -429,6 +534,24 @@ defmodule SymphonyElixir.Workspace do
 
       _ ->
         {:error, {:workspace_prepare_failed, :invalid_output, output}}
+    end
+  end
+
+  defp parse_remote_workspace_status_output(output) do
+    lines = String.split(IO.iodata_to_binary(output), "\n", trim: true)
+
+    payload =
+      Enum.find_value(lines, fn line ->
+        case String.split(line, "\t", parts: 2) do
+          [@remote_workspace_status_marker, "1"] -> {:ok, true}
+          [@remote_workspace_status_marker, "0"] -> {:ok, false}
+          _ -> nil
+        end
+      end)
+
+    case payload do
+      {:ok, value} when is_boolean(value) -> {:ok, value}
+      nil -> {:error, {:workspace_status_failed, :invalid_output, output}}
     end
   end
 

@@ -56,6 +56,30 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert Path.basename(first_workspace) == "MT_Det"
   end
 
+  test "workspace status reports whether an issue workspace already exists" do
+    workspace_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-workspace-status-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+
+      assert {:ok, missing_status} = Workspace.status_for_issue("MT-STATUS")
+      assert missing_status.exists? == false
+      assert missing_status.bootstrap_key == Workspace.bootstrap_key(nil)
+
+      assert {:ok, workspace} = Workspace.create_for_issue("MT-STATUS")
+
+      assert {:ok, existing_status} = Workspace.status_for_issue("MT-STATUS")
+      assert existing_status.exists? == true
+      assert existing_status.path == workspace
+    after
+      File.rm_rf(workspace_root)
+    end
+  end
+
   test "workspace reuses existing issue directory without deleting local changes" do
     workspace_root =
       Path.join(
@@ -206,6 +230,8 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
       assert {:error, {:workspace_hook_failed, "after_create", 17, _output}} =
                Workspace.create_for_issue("MT-FAIL")
+
+      refute File.exists?(Path.join(workspace_root, "MT-FAIL"))
     after
       File.rm_rf(workspace_root)
     end
@@ -227,6 +253,8 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
       assert {:error, {:workspace_hook_timeout, "after_create", 10}} =
                Workspace.create_for_issue("MT-TIMEOUT")
+
+      refute File.exists?(Path.join(workspace_root, "MT-TIMEOUT"))
     after
       File.rm_rf(workspace_root)
     end

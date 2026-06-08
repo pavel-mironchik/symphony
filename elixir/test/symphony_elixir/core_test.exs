@@ -1080,6 +1080,101 @@ defmodule SymphonyElixir.CoreTest do
     assert Orchestrator.select_worker_host_for_test(state, "worker-a") == "worker-a"
   end
 
+  test "worker runtime info releases the workspace bootstrap gate" do
+    issue = %Issue{id: "issue-bootstrap-runtime", identifier: "MT-BOOT-RUNTIME"}
+    bootstrap_key = {:local, "/tmp/symphony-bootstrap-runtime"}
+
+    state = %Orchestrator.State{
+      running: %{
+        issue.id => %{
+          issue: issue,
+          worker_host: nil,
+          workspace_bootstrap_key: bootstrap_key
+        }
+      },
+      workspace_bootstraps: %{
+        bootstrap_key => %{issue_id: issue.id, issue_identifier: issue.identifier}
+      },
+      retry_attempts: %{}
+    }
+
+    assert {:noreply, updated_state} =
+             Orchestrator.handle_info(
+               {:worker_runtime_info, issue.id, %{worker_host: nil, workspace_path: "/tmp/workspaces/MT-BOOT-RUNTIME"}},
+               state
+             )
+
+    assert updated_state.workspace_bootstraps == %{}
+    refute Map.has_key?(updated_state.running[issue.id], :workspace_bootstrap_key)
+    assert updated_state.running[issue.id].workspace_path == "/tmp/workspaces/MT-BOOT-RUNTIME"
+  end
+
+  test "fresh workspace retry stays queued while bootstrap gate is held" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-bootstrap-gate-#{System.unique_integer([:positive])}"
+      )
+
+    previous_memory_issues = Application.get_env(:symphony_elixir, :memory_tracker_issues)
+    workspace_root = Path.join(test_root, "workspaces")
+
+    issue = %Issue{
+      id: "issue-bootstrap-retry",
+      identifier: "MT-BOOT-RETRY",
+      title: "Second fresh bootstrap",
+      state: "Todo"
+    }
+
+    try do
+      File.mkdir_p!(test_root)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        tracker_kind: "memory",
+        workspace_root: workspace_root
+      )
+
+      Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+      bootstrap_key = Workspace.bootstrap_key(nil)
+
+      state = %Orchestrator.State{
+        max_concurrent_agents: 10,
+        claimed: MapSet.new([issue.id]),
+        codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+        retry_attempts: %{},
+        workspace_bootstraps: %{
+          bootstrap_key => %{issue_id: "issue-bootstrap-active", issue_identifier: "MT-BOOT-ACTIVE"}
+        }
+      }
+
+      updated_state =
+        Orchestrator.handle_retry_issue_lookup_for_test(issue, state, issue.id, 1, %{
+          identifier: issue.identifier,
+          issue_url: issue.url
+        })
+
+      assert updated_state.running == %{}
+      assert updated_state.workspace_bootstraps == state.workspace_bootstraps
+      assert MapSet.member?(updated_state.claimed, issue.id)
+      assert %{attempt: 2, error: "workspace bootstrap gate busy"} = updated_state.retry_attempts[issue.id]
+
+      cancel_retry_timers(updated_state)
+    after
+      restore_app_env(:memory_tracker_issues, previous_memory_issues)
+      File.rm_rf(test_root)
+    end
+  end
+
+  defp cancel_retry_timers(%Orchestrator.State{} = state) do
+    Enum.each(state.retry_attempts, fn
+      {_issue_id, %{timer_ref: timer_ref}} when is_reference(timer_ref) ->
+        Process.cancel_timer(timer_ref)
+
+      _entry ->
+        :ok
+    end)
+  end
+
   defp assert_due_in_range(due_at_ms, min_remaining_ms, max_remaining_ms) do
     remaining_ms = due_at_ms - System.monotonic_time(:millisecond)
 
