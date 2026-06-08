@@ -28,6 +28,11 @@ Symphony stops the active agent for that issue and cleans up matching workspaces
 It also sweeps terminal-state workspaces at startup and once per hour, so issues that become
 terminal while idle do not wait for a service restart before cleanup.
 
+If Codex reports that operator input, approval, or MCP elicitation is required, Symphony keeps the
+issue claimed and exposes it as blocked in the runtime state, JSON API, and dashboard. Blocked
+entries are in memory only; restarting the orchestrator clears that blocked map, so any still-active
+Linear issue can become a dispatch candidate again after restart.
+
 ## How to use it
 
 1. Make sure your codebase is set up to work well with agents: see
@@ -112,6 +117,9 @@ Title: {{ issue.title }} Body: {{ issue.description }}
 Notes:
 
 - If a value is missing, defaults are used.
+- `tracker.required_labels` is optional. When set, an issue must have every
+  configured label to dispatch or continue running. Label matching ignores
+  case and surrounding whitespace. A blank configured label matches no issue.
 - Safer Codex defaults are used when policy fields are omitted:
   - `codex.approval_policy` defaults to `{"reject":{"sandbox_approval":true,"rules":true,"mcp_elicitations":true}}`
   - `codex.thread_sandbox` defaults to `workspace-write`
@@ -121,6 +129,9 @@ Notes:
 - When `codex.turn_sandbox_policy` is set explicitly, Symphony passes the map through to Codex
   unchanged. Compatibility then depends on the targeted Codex app-server version rather than local
   Symphony validation.
+- Workflows that run package managers or other commands that resolve external hosts should set
+  `networkAccess: true` in `codex.turn_sandbox_policy`; otherwise DNS/network access may be denied
+  by the Codex turn sandbox.
 - `agent.max_turns` caps how many back-to-back Codex turns Symphony will run in a single agent
   invocation when a turn completes normally but the issue is still in an active state. Default: `20`.
 - If the Markdown body is blank, Symphony uses a default prompt template that includes the issue
@@ -144,7 +155,7 @@ hooks:
   after_create: |
     git clone --depth 1 "$SOURCE_REPO_URL" .
 codex:
-  command: "$CODEX_BIN app-server --model gpt-5.3-codex"
+  command: "$CODEX_BIN --config 'model=\"gpt-5.5\"' app-server"
 ```
 
 - If `WORKFLOW.md` is missing or has invalid YAML at startup, Symphony does not boot.
@@ -161,6 +172,7 @@ The observability UI now runs on a minimal Phoenix stack:
 - JSON API for operational debugging under `/api/v1/*`
 - Bandit as the HTTP server
 - Phoenix dependency static assets for the LiveView client bootstrap
+- Tracker issue identifiers link to the tracker-provided URL when it uses `http` or `https`
 
 ## Project Layout
 

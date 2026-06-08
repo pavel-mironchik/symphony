@@ -398,6 +398,14 @@ pre,
   overflow: hidden;
 }
 
+.issue-id-link {
+  color: inherit;
+  text-decoration: underline;
+  text-decoration-color: currentColor;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 0.18em;
+}
+
 .issue-link {
   color: var(--muted);
   font-size: 0.86rem;
