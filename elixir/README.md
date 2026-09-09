@@ -157,6 +157,10 @@ Notes:
   - `codex.turn_sandbox_policy` defaults to a `workspaceWrite` policy rooted at the current issue workspace
 - `codex.turn_timeout_ms` is the maximum silence interval while a turn is streaming. Each
   app-server update resets it; it is not a total turn runtime cap.
+- Terminal events settle a turn only when both the thread ID and turn ID match the
+  requested turn. Child-agent, stale, and unidentified terminal events remain notifications;
+  they do not advance `agent.max_turns` or trigger continuation. A matching `turn/completed`
+  with status `failed` or `interrupted` is treated as failure or cancellation, not success.
 - Supported `codex.approval_policy` values depend on the targeted Codex app-server version. In the current local Codex schema, string values include `untrusted`, `on-failure`, `on-request`, and `never`, and object-form `reject` is also supported.
 - Supported `codex.thread_sandbox` values: `read-only`, `workspace-write`, `danger-full-access`.
 - When `codex.turn_sandbox_policy` is set explicitly, Symphony passes the map through to Codex
